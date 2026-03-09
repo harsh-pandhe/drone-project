@@ -1,0 +1,19 @@
+=== ASCEND MISSION CONTROL ULTIMATE v6.1 SESSION: 20260309_175834 ===
+[17:58:34.051] Connected to Pixhawk!
+[17:58:34.109] SYS: Barometer 1 calibration complete
+[17:58:34.967] SYS: ArduPilot Ready
+[17:58:34.972] SYS: AHRS: DCM active
+[17:58:35.074] SYS: RCOut: PWM:1-16
+[17:58:37.166] SYS: EKF3 IMU0 initialised
+[17:58:37.305] SYS: EKF3 IMU1 initialised
+[17:58:37.311] SYS: AHRS: EKF3 active
+[17:58:37.319] SYS: EKF3 IMU0 fusing optical flow
+[17:58:37.325] SYS: EKF3 IMU1 fusing optical flow
+[17:58:37.333] SYS: EKF3 IMU0 tilt alignment complete
+[17:58:37.341] SYS: EKF3 IMU0 started relative aiding
+[17:58:37.350] SYS: EKF3 IMU1 tilt alignment complete
+[17:58:37.358] SYS: EKF3 IMU1 started relative aiding
+[17:58:37.369] SYS: EKF3 IMU0 MAG0 initial yaw alignment complete
+[17:58:37.377] SYS: EKF3 IMU1 MAG0 initial yaw alignment complete
+[17:58:52.793] SYS: Battery 1 is critical 11.65V used 5 mAh
+[17:58:52.799] SYS: Battery Failsafe

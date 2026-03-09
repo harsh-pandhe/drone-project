@@ -1,0 +1,4 @@
+=== ASCEND MISSION CONTROL ULTIMATE v6.1 SESSION: 20260309_175754 ===
+[17:58:32.570] Connected to Pixhawk!
+[17:58:32.570] SYS: Initialising ArduPilot
+[17:58:32.571] SYS: Calibrating barometer

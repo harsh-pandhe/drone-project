@@ -1,0 +1,144 @@
+=== ASCEND MISSION CONTROL FINAL v5.2 (ANYHOW EDITION) ===
+[19:34:16.592] Connected to Pixhawk!
+[19:34:17.178] SYS: Field Elevation Set: 0m
+[19:34:18.075] SYS: Field Elevation Set: 0m
+[19:34:18.977] SYS: Updating barometer calibration
+[19:34:18.986] SYS: Barometer calibration complete
+[19:34:19.147] SYS: Field Elevation Set: 0m
+[19:34:20.182] SYS: Field Elevation Set: 0m
+[19:34:21.165] SYS: Field Elevation Set: 0m
+[19:34:21.600] CMD: Forcing Origin and Home...
+[19:34:22.254] SYS: Field Elevation Set: 0m
+[19:34:23.289] SYS: Field Elevation Set: 0m
+[19:34:24.319] SYS: Field Elevation Set: 0m
+[19:34:25.358] SYS: Field Elevation Set: 0m
+[19:34:26.002] AUTO: Init 1m Flight sequence...
+[19:34:26.002] AUTO: Setting mode to ALT_HOLD...
+[19:34:26.399] SYS: Field Elevation Set: 0m
+[19:34:26.502] AUTO: Arming Motors...
+[19:34:28.503] AUTO: Liftoff from -0.28m...
+[19:34:29.192] SYS: EKF3 IMU1 MAG0 in-flight yaw alignment complete
+[19:34:29.484] SYS: EKF3 IMU0 MAG0 in-flight yaw alignment complete
+[19:34:35.701] SYS: Field Elevation Set: 0m
+[19:34:36.722] SYS: Field Elevation Set: 0m
+[19:34:37.608] SYS: Field Elevation Set: 0m
+[19:34:38.788] SYS: Field Elevation Set: 0m
+[19:34:39.671] SYS: Field Elevation Set: 0m
+[19:34:40.696] SYS: Field Elevation Set: 0m
+[19:34:41.720] SYS: Field Elevation Set: 0m
+[19:34:42.756] SYS: Field Elevation Set: 0m
+[19:34:43.647] SYS: Field Elevation Set: 0m
+[19:34:44.661] AUTO: Init 1m Flight sequence...
+[19:34:44.661] AUTO: Setting mode to ALT_HOLD...
+[19:34:44.683] SYS: Field Elevation Set: 0m
+[19:34:45.161] AUTO: Arming Motors...
+[19:34:47.161] AUTO: Liftoff from -0.06m...
+[19:35:01.442] SYS: Potential Thrust Loss (4)
+[19:35:05.873] SYS: Potential Thrust Loss (4)
+[19:35:10.313] SYS: Potential Thrust Loss (4)
+[19:35:14.711] SYS: Potential Thrust Loss (4)
+[19:35:18.625] CMD: EMERGENCY STOP
+[19:35:18.970] SYS: Potential Thrust Loss (4)
+[19:35:21.858] CMD: EMERGENCY STOP
+[19:35:23.323] CMD: EMERGENCY STOP
+[19:35:23.388] SYS: Potential Thrust Loss (4)
+[19:35:24.486] AUTO: Starting Landing...
+[19:35:27.675] SYS: Potential Thrust Loss (4)
+[19:35:27.691] AUTO: Landed and Disarmed.
+[19:35:32.095] SYS: Potential Thrust Loss (4)
+[19:35:32.377] AUTO: Starting Landing...
+[19:35:35.582] AUTO: Landed and Disarmed.
+[19:35:36.521] SYS: Potential Thrust Loss (4)
+[19:35:39.619] SYS: Field Elevation Set: 0m
+[19:35:40.486] SYS: Field Elevation Set: 0m
+[19:35:41.671] SYS: Field Elevation Set: 0m
+[19:35:42.560] SYS: Field Elevation Set: 0m
+[19:35:43.595] SYS: Field Elevation Set: 0m
+[19:35:44.626] SYS: Field Elevation Set: 0m
+[19:35:45.520] SYS: Field Elevation Set: 0m
+[19:35:46.539] SYS: Field Elevation Set: 0m
+[19:35:47.566] SYS: Field Elevation Set: 0m
+[19:35:48.449] SYS: Field Elevation Set: 0m
+[19:35:49.629] SYS: Field Elevation Set: 0m
+[19:35:50.653] SYS: Field Elevation Set: 0m
+[19:35:51.683] SYS: Field Elevation Set: 0m
+[19:35:52.550] SYS: Field Elevation Set: 0m
+[19:35:53.727] SYS: Field Elevation Set: 0m
+[19:35:54.621] SYS: Field Elevation Set: 0m
+[19:35:55.662] SYS: Field Elevation Set: 0m
+[19:35:56.695] SYS: Field Elevation Set: 0m
+[19:35:57.711] SYS: Field Elevation Set: 0m
+[19:35:58.436] SYS: PreArm: Need Position Estimate
+[19:35:58.728] SYS: Field Elevation Set: 0m
+[19:35:59.755] SYS: Field Elevation Set: 0m
+[19:36:00.788] SYS: Field Elevation Set: 0m
+[19:36:01.807] SYS: Field Elevation Set: 0m
+[19:36:02.673] SYS: Field Elevation Set: 0m
+[19:36:03.709] SYS: Field Elevation Set: 0m
+[19:36:04.736] SYS: Field Elevation Set: 0m
+[19:36:05.758] SYS: Field Elevation Set: 0m
+[19:36:06.785] SYS: Field Elevation Set: 0m
+[19:36:07.807] SYS: Field Elevation Set: 0m
+[19:36:08.693] SYS: Field Elevation Set: 0m
+[19:36:09.728] SYS: Field Elevation Set: 0m
+[19:36:10.756] SYS: Field Elevation Set: 0m
+[19:36:11.641] SYS: Field Elevation Set: 0m
+[19:36:12.810] SYS: Field Elevation Set: 0m
+[19:36:13.693] SYS: Field Elevation Set: 0m
+[19:36:14.737] SYS: Field Elevation Set: 0m
+[19:36:15.773] SYS: Field Elevation Set: 0m
+[19:36:16.656] SYS: Field Elevation Set: 0m
+[19:36:17.839] SYS: Field Elevation Set: 0m
+[19:36:18.730] SYS: Field Elevation Set: 0m
+[19:36:19.760] SYS: Field Elevation Set: 0m
+[19:36:20.787] SYS: Field Elevation Set: 0m
+[19:36:21.687] SYS: Field Elevation Set: 0m
+[19:36:22.722] SYS: Field Elevation Set: 0m
+[19:36:23.755] SYS: Field Elevation Set: 0m
+[19:36:24.636] SYS: Field Elevation Set: 0m
+[19:36:25.807] SYS: Field Elevation Set: 0m
+[19:36:26.690] SYS: Field Elevation Set: 0m
+[19:36:27.715] SYS: Field Elevation Set: 0m
+[19:36:28.745] SYS: Field Elevation Set: 0m
+[19:36:29.630] SYS: PreArm: Need Position Estimate
+[19:36:29.636] SYS: Field Elevation Set: 0m
+[19:36:30.797] SYS: Field Elevation Set: 0m
+[19:36:31.680] SYS: Field Elevation Set: 0m
+[19:36:32.868] SYS: Field Elevation Set: 0m
+[19:36:33.751] SYS: Field Elevation Set: 0m
+[19:36:34.775] SYS: Field Elevation Set: 0m
+[19:36:35.656] SYS: Field Elevation Set: 0m
+[19:36:36.686] SYS: Field Elevation Set: 0m
+[19:36:37.855] SYS: Field Elevation Set: 0m
+[19:36:38.729] SYS: Field Elevation Set: 0m
+[19:36:39.623] SYS: Field Elevation Set: 0m
+[19:36:40.215] SYS: Updating barometer calibration
+[19:36:40.226] SYS: Barometer calibration complete
+[19:36:40.817] SYS: Field Elevation Set: 0m
+[19:36:41.686] SYS: Field Elevation Set: 0m
+[19:36:41.856] CMD: Forcing Origin and Home...
+[19:36:42.716] SYS: Field Elevation Set: 0m
+[19:36:43.744] SYS: Field Elevation Set: 0m
+[19:36:44.779] SYS: Field Elevation Set: 0m
+[19:36:45.812] SYS: Field Elevation Set: 0m
+[19:36:46.701] SYS: Field Elevation Set: 0m
+[19:36:46.964] AUTO: Init 1m Flight sequence...
+[19:36:46.964] AUTO: Setting mode to ALT_HOLD...
+[19:36:47.465] AUTO: Arming Motors...
+[19:36:49.465] AUTO: Liftoff from 0.12m...
+[19:36:50.646] SYS: EKF3 IMU0 MAG0 in-flight yaw alignment complete
+[19:37:13.951] AUTO: Starting Landing...
+[19:37:17.157] AUTO: Landed and Disarmed.
+[19:37:18.733] AUTO: 1m Target Reached. Engaging LOITER.
+[19:37:18.733] AUTO: Stable Hover Active.
+[19:37:18.868] SYS: Mode change to LOITER failed: requires position
+[19:37:19.181] SYS: Battery 1 is low 12.33V used 151 mAh
+[19:37:19.190] SYS: Battery Failsafe - Disarming
+[19:37:19.195] SYS: Field Elevation Set: 0m
+[19:37:20.200] SYS: Field Elevation Set: 0m
+[19:37:21.219] SYS: Field Elevation Set: 0m
+[19:37:22.108] SYS: Field Elevation Set: 0m
+[19:37:23.263] SYS: Field Elevation Set: 0m
+[19:37:24.140] SYS: Field Elevation Set: 0m
+[19:37:25.159] SYS: Field Elevation Set: 0m
+[19:37:26.178] SYS: Field Elevation Set: 0m

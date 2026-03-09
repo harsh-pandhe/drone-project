@@ -1,0 +1,5 @@
+=== ASCEND FLIGHT LOG (RC OVERRIDE MODE): 20260308_150817 ===
+[15:08:17.471] Connected to Pixhawk!
+[15:08:17.514] SYS: Initialising ArduPilot
+[15:08:22.515] SYS: Initialising ArduPilot
+[15:08:27.516] SYS: Initialising ArduPilot

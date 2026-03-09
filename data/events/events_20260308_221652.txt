@@ -1,0 +1,95 @@
+=== ASCEND MISSION CONTROL ULTIMATE v6.1 SESSION: 20260308_221652 ===
+[22:16:53.023] Connected to Pixhawk!
+[22:16:53.539] SYS: Field Elevation Set: 0m
+[22:16:54.720] SYS: Field Elevation Set: 0m
+[22:16:55.606] SYS: Field Elevation Set: 0m
+[22:16:56.642] SYS: Field Elevation Set: 0m
+[22:16:57.670] SYS: Field Elevation Set: 0m
+[22:16:58.550] SYS: Field Elevation Set: 0m
+[22:16:59.578] SYS: Field Elevation Set: 0m
+[22:17:00.268] CMD: EMERGENCY STOP
+[22:17:00.472] SYS: Updating barometer calibration
+[22:17:00.481] SYS: Barometer calibration complete
+[22:17:00.634] SYS: Field Elevation Set: 0m
+[22:17:01.670] SYS: Field Elevation Set: 0m
+[22:17:02.697] SYS: Field Elevation Set: 0m
+[22:17:03.578] SYS: Field Elevation Set: 0m
+[22:17:04.606] SYS: Field Elevation Set: 0m
+[22:17:05.217] SYS: Updating barometer calibration
+[22:17:05.225] SYS: Barometer calibration complete
+[22:17:05.525] SYS: Field Elevation Set: 0m
+[22:17:06.711] SYS: Field Elevation Set: 0m
+[22:17:07.592] SYS: Field Elevation Set: 0m
+[22:17:07.605] CMD: Forcing Origin Reset...
+[22:17:08.633] SYS: Field Elevation Set: 0m
+[22:17:09.661] SYS: Field Elevation Set: 0m
+[22:17:10.528] SYS: Field Elevation Set: 0m
+[22:17:11.692] SYS: Field Elevation Set: 0m
+[22:17:12.572] SYS: Field Elevation Set: 0m
+[22:17:13.750] SYS: Field Elevation Set: 0m
+[22:17:14.587] AUTO: Starting Smooth Takeoff...
+[22:17:14.587] AUTO: Anchoring EKF Origin...
+[22:17:14.630] SYS: Field Elevation Set: 0m
+[22:17:15.616] SYS: Field Elevation Set: 0m
+[22:17:16.088] AUTO: Ground: -0.27m. Target: 0.73m
+[22:17:18.089] AUTO: Ascending smoothly (PWM 1620)...
+[22:17:19.645] AUTO: Braking climb. Engaging Hover.
+[22:17:20.145] AUTO: Activating Optical Flow (LOITER)...
+[22:17:20.145] AUTO: 1m Flight Stable.
+[22:17:20.358] SYS: Mode change to LOITER failed: requires position
+[22:17:23.746] AUTO: Starting Precision Landing...
+[22:17:23.746] AUTO: Engaging Mode LAND...
+[22:17:24.146] AUTO: Ground contact detected.
+[22:17:24.146] AUTO: Final Disarming...
+[22:17:24.146] AUTO: Disarmed. Landing Complete.
+[22:17:26.214] SYS: Field Elevation Set: 0m
+[22:17:27.094] SYS: Field Elevation Set: 0m
+[22:17:28.119] SYS: Field Elevation Set: 0m
+[22:17:29.147] SYS: Field Elevation Set: 0m
+[22:17:30.175] SYS: Field Elevation Set: 0m
+[22:17:31.061] SYS: Field Elevation Set: 0m
+[22:17:32.088] SYS: Field Elevation Set: 0m
+[22:17:33.122] SYS: Field Elevation Set: 0m
+[22:17:34.144] SYS: Field Elevation Set: 0m
+[22:17:34.528] AUTO: Starting Smooth Takeoff...
+[22:17:34.528] AUTO: Anchoring EKF Origin...
+[22:17:35.174] SYS: Field Elevation Set: 0m
+[22:17:36.029] AUTO: Ground: -0.01m. Target: 0.99m
+[22:17:36.219] SYS: Field Elevation Set: 0m
+[22:17:38.029] AUTO: Ascending smoothly (PWM 1620)...
+[22:17:46.163] AUTO: Starting Precision Landing...
+[22:17:46.163] AUTO: Engaging Mode LAND...
+[22:17:46.363] AUTO: Ground contact detected.
+[22:17:46.364] AUTO: Final Disarming...
+[22:17:46.364] AUTO: Disarmed. Landing Complete.
+[22:17:48.130] SYS: Field Elevation Set: 0m
+[22:17:49.163] SYS: Field Elevation Set: 0m
+[22:17:50.188] SYS: Field Elevation Set: 0m
+[22:17:51.069] SYS: Field Elevation Set: 0m
+[22:17:52.102] SYS: Field Elevation Set: 0m
+[22:17:53.121] SYS: Field Elevation Set: 0m
+[22:17:54.155] SYS: Field Elevation Set: 0m
+[22:17:55.188] SYS: Field Elevation Set: 0m
+[22:17:56.069] SYS: Field Elevation Set: 0m
+[22:17:57.102] SYS: Field Elevation Set: 0m
+[22:17:58.130] SYS: Field Elevation Set: 0m
+[22:17:59.032] SYS: Field Elevation Set: 0m
+[22:18:00.210] SYS: Field Elevation Set: 0m
+[22:18:01.096] SYS: Field Elevation Set: 0m
+[22:18:01.575] AUTO: Starting Smooth Takeoff...
+[22:18:01.575] AUTO: Anchoring EKF Origin...
+[22:18:02.138] SYS: Field Elevation Set: 0m
+[22:18:03.075] AUTO: Ground: 0.05m. Target: 1.05m
+[22:18:03.177] SYS: Field Elevation Set: 0m
+[22:18:05.076] AUTO: Ascending smoothly (PWM 1620)...
+[22:18:11.770] AUTO: Starting Precision Landing...
+[22:18:11.770] AUTO: Engaging Mode LAND...
+[22:18:12.371] AUTO: Ground contact detected.
+[22:18:12.371] AUTO: Final Disarming...
+[22:18:12.371] AUTO: Disarmed. Landing Complete.
+[22:18:13.671] SYS: Field Elevation Set: 0m
+[22:18:14.532] SYS: Field Elevation Set: 0m
+[22:18:15.677] SYS: Field Elevation Set: 0m
+[22:18:16.702] SYS: Field Elevation Set: 0m
+[22:18:17.591] SYS: Field Elevation Set: 0m
+[22:18:18.613] SYS: Field Elevation Set: 0m

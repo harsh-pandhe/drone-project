@@ -1,0 +1,7 @@
+=== ASCEND MISSIONKONTROL FINAL v5.1 SESSION: 20260308_193257 ===
+[19:32:58.625] MavLink Forbindelse Etableret.
+[19:32:59.070] SYS: Field Elevation Set: 0m
+[19:33:00.100] SYS: Field Elevation Set: 0m
+[19:33:01.130] SYS: Field Elevation Set: 0m
+[19:33:02.163] SYS: Field Elevation Set: 0m
+[19:33:03.199] SYS: Field Elevation Set: 0m

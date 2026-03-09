@@ -11,13 +11,8 @@ ascend_env/
 venv/
 env/
 
-# Data directories (large, generated locally)
-data/
-
-# Logs and event files
+# Logs
 *.log
-events_*.txt
-telemetry_*.csv
 
 # IDE and editor
 .vscode/

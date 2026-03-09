@@ -1,0 +1,321 @@
+=== ASCEND MISSION CONTROL ULTIMATE v5.9 SESSION: 20260308_220318 ===
+[22:03:18.832] Connected to Pixhawk!
+[22:03:24.747] SYS: Updating barometer calibration
+[22:03:24.758] SYS: Barometer calibration complete
+[22:03:28.867] CMD: Forcing Origin Reset...
+[22:03:29.049] SYS: EKF3 IMU0 origin set
+[22:03:29.110] SYS: EKF3 IMU1 origin set
+[22:03:29.121] SYS: Field Elevation Set: 0m
+[22:03:30.138] SYS: Field Elevation Set: 0m
+[22:03:31.019] SYS: Field Elevation Set: 0m
+[22:03:32.051] SYS: Field Elevation Set: 0m
+[22:03:33.068] SYS: Field Elevation Set: 0m
+[22:03:34.090] SYS: Field Elevation Set: 0m
+[22:03:35.124] SYS: Field Elevation Set: 0m
+[22:03:36.141] SYS: Field Elevation Set: 0m
+[22:03:43.710] AUTO: Starting Automatic Takeoff...
+[22:03:43.710] AUTO: Anchoring EKF Origin...
+[22:03:45.213] AUTO: Ground: 0.07m. Target: 1.07m
+[22:03:46.886] SYS: Field Elevation Set: 0m
+[22:03:47.214] AUTO: Arming FAILED. Press [o] manually.
+[22:03:47.911] SYS: Field Elevation Set: 0m
+[22:03:48.938] SYS: Field Elevation Set: 0m
+[22:03:49.824] SYS: Field Elevation Set: 0m
+[22:03:50.999] SYS: Field Elevation Set: 0m
+[22:03:51.882] SYS: Field Elevation Set: 0m
+[22:03:52.054] AUTO: Starting Automatic Takeoff...
+[22:03:52.054] AUTO: Anchoring EKF Origin...
+[22:03:52.781] SYS: Field Elevation Set: 0m
+[22:03:53.554] AUTO: Ground: -0.04m. Target: 0.96m
+[22:03:55.555] AUTO: Ramping throttle...
+[22:03:58.516] AUTO: 1m Flight Stable.
+[22:03:58.763] SYS: Mode change to LOITER failed: requires position
+[22:04:01.845] SYS: EKF3 IMU1 MAG0 ground mag anomaly, yaw re-aligned
+[22:04:01.857] SYS: EKF3 IMU0 MAG0 ground mag anomaly, yaw re-aligned
+[22:04:07.959] AUTO: Starting Landing...
+[22:04:07.959] AUTO: Engaging Mode LAND...
+[22:04:11.563] AUTO: Ground contact detected.
+[22:04:11.563] AUTO: Final Disarming...
+[22:04:11.563] AUTO: Disarmed. Landing Complete.
+[22:04:13.843] SYS: Field Elevation Set: 0m
+[22:04:14.729] SYS: Field Elevation Set: 0m
+[22:04:15.904] SYS: Field Elevation Set: 0m
+[22:04:16.912] SYS: Field Elevation Set: 0m
+[22:04:16.921] SYS: EKF3 IMU0 stopped aiding
+[22:04:16.929] SYS: EKF3 IMU0 started relative aiding
+[22:04:16.937] SYS: EKF3 IMU0 fusing optical flow
+[22:04:17.823] SYS: Field Elevation Set: 0m
+[22:04:19.009] SYS: Field Elevation Set: 0m
+[22:04:19.884] SYS: Field Elevation Set: 0m
+[22:04:20.915] SYS: Field Elevation Set: 0m
+[22:04:21.953] SYS: Field Elevation Set: 0m
+[22:04:22.831] SYS: Field Elevation Set: 0m
+[22:04:23.872] SYS: Field Elevation Set: 0m
+[22:04:24.906] SYS: Field Elevation Set: 0m
+[22:04:25.931] SYS: Field Elevation Set: 0m
+[22:04:26.814] SYS: Field Elevation Set: 0m
+[22:04:27.847] SYS: Field Elevation Set: 0m
+[22:04:28.869] SYS: Field Elevation Set: 0m
+[22:04:29.900] SYS: Field Elevation Set: 0m
+[22:04:30.927] SYS: Field Elevation Set: 0m
+[22:04:31.808] SYS: Field Elevation Set: 0m
+[22:04:32.997] SYS: Field Elevation Set: 0m
+[22:04:33.866] SYS: Field Elevation Set: 0m
+[22:04:35.043] SYS: Field Elevation Set: 0m
+[22:04:36.071] SYS: Field Elevation Set: 0m
+[22:04:36.910] SYS: Field Elevation Set: 0m
+[22:04:38.090] SYS: Field Elevation Set: 0m
+[22:04:38.974] SYS: Field Elevation Set: 0m
+[22:04:40.004] SYS: Field Elevation Set: 0m
+[22:04:41.035] SYS: Field Elevation Set: 0m
+[22:04:41.918] SYS: Field Elevation Set: 0m
+[22:04:43.087] SYS: Field Elevation Set: 0m
+[22:04:43.957] SYS: Field Elevation Set: 0m
+[22:04:45.001] SYS: Field Elevation Set: 0m
+[22:04:45.064] AUTO: Starting Automatic Takeoff...
+[22:04:45.064] AUTO: Anchoring EKF Origin...
+[22:04:46.037] SYS: Field Elevation Set: 0m
+[22:04:46.565] AUTO: Ground: 0.0m. Target: 1.0m
+[22:04:48.565] AUTO: Ramping throttle...
+[22:04:51.778] AUTO: 1m Flight Stable.
+[22:04:52.024] SYS: Mode change to LOITER failed: requires position
+[22:05:31.516] AUTO: Starting Landing...
+[22:05:31.516] AUTO: Engaging Mode LAND...
+[22:05:35.320] AUTO: Ground contact detected.
+[22:05:35.320] AUTO: Final Disarming...
+[22:05:35.320] AUTO: Disarmed. Landing Complete.
+[22:05:36.147] SYS: Field Elevation Set: 0m
+[22:05:37.155] SYS: Field Elevation Set: 0m
+[22:05:38.185] SYS: Field Elevation Set: 0m
+[22:05:39.062] SYS: Field Elevation Set: 0m
+[22:05:40.217] SYS: Field Elevation Set: 0m
+[22:05:41.239] SYS: Field Elevation Set: 0m
+[22:05:42.261] SYS: Field Elevation Set: 0m
+[22:05:43.283] SYS: Field Elevation Set: 0m
+[22:05:44.155] SYS: Field Elevation Set: 0m
+[22:05:45.310] SYS: Field Elevation Set: 0m
+[22:05:46.338] SYS: Field Elevation Set: 0m
+[22:05:47.226] SYS: Field Elevation Set: 0m
+[22:05:48.251] SYS: Field Elevation Set: 0m
+[22:05:49.262] SYS: Field Elevation Set: 0m
+[22:05:50.281] SYS: Field Elevation Set: 0m
+[22:05:51.155] SYS: Field Elevation Set: 0m
+[22:05:51.586] SYS: EKF3 IMU0 stopped aiding
+[22:05:51.594] SYS: EKF3 IMU0 started relative aiding
+[22:05:51.603] SYS: EKF3 IMU0 fusing optical flow
+[22:05:52.336] SYS: Field Elevation Set: 0m
+[22:05:53.213] SYS: Field Elevation Set: 0m
+[22:05:54.241] SYS: Field Elevation Set: 0m
+[22:05:55.265] SYS: Field Elevation Set: 0m
+[22:05:56.140] SYS: Field Elevation Set: 0m
+[22:05:57.290] SYS: Field Elevation Set: 0m
+[22:05:58.312] SYS: Field Elevation Set: 0m
+[22:05:59.184] SYS: Field Elevation Set: 0m
+[22:06:00.200] SYS: Field Elevation Set: 0m
+[22:06:01.225] SYS: Field Elevation Set: 0m
+[22:06:02.244] SYS: Field Elevation Set: 0m
+[22:06:03.266] SYS: Field Elevation Set: 0m
+[22:06:04.143] SYS: Field Elevation Set: 0m
+[22:06:05.324] SYS: Field Elevation Set: 0m
+[22:06:06.221] SYS: Field Elevation Set: 0m
+[22:06:07.248] SYS: Field Elevation Set: 0m
+[22:06:08.281] SYS: Field Elevation Set: 0m
+[22:06:09.284] SYS: Field Elevation Set: 0m
+[22:06:10.300] SYS: Field Elevation Set: 0m
+[22:06:11.180] SYS: Field Elevation Set: 0m
+[22:06:12.197] SYS: Field Elevation Set: 0m
+[22:06:13.366] SYS: Field Elevation Set: 0m
+[22:06:14.243] SYS: Field Elevation Set: 0m
+[22:06:15.271] SYS: Field Elevation Set: 0m
+[22:06:16.154] SYS: Field Elevation Set: 0m
+[22:06:17.304] SYS: Field Elevation Set: 0m
+[22:06:18.198] SYS: Field Elevation Set: 0m
+[22:06:19.217] SYS: Field Elevation Set: 0m
+[22:06:20.236] SYS: Field Elevation Set: 0m
+[22:06:21.253] SYS: Field Elevation Set: 0m
+[22:06:22.280] SYS: Field Elevation Set: 0m
+[22:06:23.166] SYS: Field Elevation Set: 0m
+[22:06:24.185] SYS: Field Elevation Set: 0m
+[22:06:25.224] SYS: Field Elevation Set: 0m
+[22:06:26.254] SYS: Field Elevation Set: 0m
+[22:06:27.265] SYS: Field Elevation Set: 0m
+[22:06:28.282] SYS: Field Elevation Set: 0m
+[22:06:29.148] SYS: Field Elevation Set: 0m
+[22:06:30.306] SYS: Field Elevation Set: 0m
+[22:06:31.325] SYS: Field Elevation Set: 0m
+[22:06:32.192] SYS: Field Elevation Set: 0m
+[22:06:33.220] SYS: Field Elevation Set: 0m
+[22:06:34.228] SYS: Field Elevation Set: 0m
+[22:06:35.255] SYS: Field Elevation Set: 0m
+[22:06:36.144] SYS: Field Elevation Set: 0m
+[22:06:37.310] SYS: Field Elevation Set: 0m
+[22:06:38.324] SYS: Field Elevation Set: 0m
+[22:06:39.204] SYS: Field Elevation Set: 0m
+[22:06:40.224] SYS: Field Elevation Set: 0m
+[22:06:41.240] SYS: Field Elevation Set: 0m
+[22:06:42.251] SYS: Field Elevation Set: 0m
+[22:06:43.134] SYS: Field Elevation Set: 0m
+[22:06:44.286] SYS: Field Elevation Set: 0m
+[22:06:45.312] SYS: Field Elevation Set: 0m
+[22:06:46.186] SYS: Field Elevation Set: 0m
+[22:06:47.203] SYS: Field Elevation Set: 0m
+[22:06:48.219] SYS: Field Elevation Set: 0m
+[22:06:49.235] SYS: Field Elevation Set: 0m
+[22:06:50.394] SYS: Field Elevation Set: 0m
+[22:06:51.424] SYS: Field Elevation Set: 0m
+[22:06:52.293] SYS: Field Elevation Set: 0m
+[22:06:53.321] SYS: Field Elevation Set: 0m
+[22:06:54.326] SYS: Field Elevation Set: 0m
+[22:06:55.340] SYS: Field Elevation Set: 0m
+[22:06:56.226] SYS: Field Elevation Set: 0m
+[22:06:57.375] SYS: Field Elevation Set: 0m
+[22:06:57.693] AUTO: Starting Automatic Takeoff...
+[22:06:57.694] AUTO: Anchoring EKF Origin...
+[22:06:58.386] SYS: Field Elevation Set: 0m
+[22:06:59.195] AUTO: Ground: -0.09m. Target: 0.91m
+[22:06:59.261] SYS: Field Elevation Set: 0m
+[22:07:01.195] AUTO: Ramping throttle...
+[22:07:03.185] SYS: EKF3 IMU0 MAG0 ground mag anomaly, yaw re-aligned
+[22:07:04.559] AUTO: 1m Flight Stable.
+[22:07:04.666] SYS: Mode change to LOITER failed: requires position
+[22:07:04.968] SYS: EKF3 IMU0 MAG0 in-flight yaw alignment complete
+[22:07:04.979] SYS: EKF3 IMU1 MAG0 in-flight yaw alignment complete
+[22:07:10.367] SYS: Potential Thrust Loss (3)
+[22:07:14.648] AUTO: Starting Landing...
+[22:07:14.649] AUTO: Engaging Mode LAND...
+[22:07:22.256] AUTO: Ground contact detected.
+[22:07:22.256] AUTO: Final Disarming...
+[22:07:22.257] AUTO: Disarmed. Landing Complete.
+[22:07:23.981] SYS: Field Elevation Set: 0m
+[22:07:25.147] SYS: Field Elevation Set: 0m
+[22:07:26.028] SYS: Field Elevation Set: 0m
+[22:07:27.047] SYS: Field Elevation Set: 0m
+[22:07:28.075] SYS: Field Elevation Set: 0m
+[22:07:29.100] SYS: Field Elevation Set: 0m
+[22:07:29.969] SYS: Field Elevation Set: 0m
+[22:07:30.969] SYS: Field Elevation Set: 0m
+[22:07:32.121] SYS: Field Elevation Set: 0m
+[22:07:32.985] SYS: Field Elevation Set: 0m
+[22:07:34.001] SYS: Field Elevation Set: 0m
+[22:07:35.012] SYS: Field Elevation Set: 0m
+[22:07:36.018] SYS: Field Elevation Set: 0m
+[22:07:37.040] SYS: Field Elevation Set: 0m
+[22:07:38.051] SYS: Field Elevation Set: 0m
+[22:07:39.064] SYS: Field Elevation Set: 0m
+[22:07:39.942] SYS: Field Elevation Set: 0m
+[22:07:41.094] SYS: Field Elevation Set: 0m
+[22:07:42.122] SYS: Field Elevation Set: 0m
+[22:07:42.988] SYS: Field Elevation Set: 0m
+[22:07:43.994] SYS: Field Elevation Set: 0m
+[22:07:45.108] SYS: Field Elevation Set: 0m
+[22:07:46.018] SYS: Field Elevation Set: 0m
+[22:07:47.024] SYS: Field Elevation Set: 0m
+[22:07:48.032] SYS: Field Elevation Set: 0m
+[22:07:49.037] SYS: Field Elevation Set: 0m
+[22:07:50.190] SYS: Field Elevation Set: 0m
+[22:07:51.201] SYS: Field Elevation Set: 0m
+[22:07:52.082] SYS: Field Elevation Set: 0m
+[22:07:53.095] SYS: Field Elevation Set: 0m
+[22:07:54.117] SYS: Field Elevation Set: 0m
+[22:07:55.142] SYS: Field Elevation Set: 0m
+[22:07:56.161] SYS: Field Elevation Set: 0m
+[22:07:57.022] SYS: Field Elevation Set: 0m
+[22:07:58.183] SYS: Field Elevation Set: 0m
+[22:07:59.049] SYS: Field Elevation Set: 0m
+[22:08:00.207] SYS: Field Elevation Set: 0m
+[22:08:01.077] SYS: Field Elevation Set: 0m
+[22:08:02.096] SYS: Field Elevation Set: 0m
+[22:08:03.112] SYS: Field Elevation Set: 0m
+[22:08:04.132] SYS: Field Elevation Set: 0m
+[22:08:05.145] SYS: Field Elevation Set: 0m
+[22:08:06.153] SYS: Field Elevation Set: 0m
+[22:08:07.020] SYS: Field Elevation Set: 0m
+[22:08:08.192] SYS: Field Elevation Set: 0m
+[22:08:09.197] SYS: Field Elevation Set: 0m
+[22:08:10.225] SYS: Field Elevation Set: 0m
+[22:08:11.247] SYS: Field Elevation Set: 0m
+[22:08:12.266] SYS: Field Elevation Set: 0m
+[22:08:13.158] SYS: Field Elevation Set: 0m
+[22:08:14.191] SYS: Field Elevation Set: 0m
+[22:08:15.213] SYS: Field Elevation Set: 0m
+[22:08:16.243] SYS: Field Elevation Set: 0m
+[22:08:17.132] SYS: Field Elevation Set: 0m
+[22:08:18.298] SYS: Field Elevation Set: 0m
+[22:08:19.179] SYS: Field Elevation Set: 0m
+[22:08:20.206] SYS: Field Elevation Set: 0m
+[22:08:21.223] SYS: Field Elevation Set: 0m
+[22:08:22.245] SYS: Field Elevation Set: 0m
+[22:08:23.131] SYS: Field Elevation Set: 0m
+[22:08:24.164] SYS: Field Elevation Set: 0m
+[22:08:25.341] SYS: Field Elevation Set: 0m
+[22:08:26.225] SYS: Field Elevation Set: 0m
+[22:08:27.247] SYS: Field Elevation Set: 0m
+[22:08:28.280] SYS: Field Elevation Set: 0m
+[22:08:29.307] SYS: Field Elevation Set: 0m
+[22:08:30.188] SYS: Field Elevation Set: 0m
+[22:08:31.215] SYS: Field Elevation Set: 0m
+[22:08:32.246] SYS: Field Elevation Set: 0m
+[22:08:33.273] SYS: Field Elevation Set: 0m
+[22:08:34.162] SYS: Field Elevation Set: 0m
+[22:08:35.345] SYS: Field Elevation Set: 0m
+[22:08:36.223] SYS: Field Elevation Set: 0m
+[22:08:37.247] SYS: Field Elevation Set: 0m
+[22:08:38.278] SYS: Field Elevation Set: 0m
+[22:08:39.305] SYS: Field Elevation Set: 0m
+[22:08:40.189] SYS: Field Elevation Set: 0m
+[22:08:41.211] SYS: Field Elevation Set: 0m
+[22:08:42.238] SYS: Field Elevation Set: 0m
+[22:08:43.274] SYS: Field Elevation Set: 0m
+[22:08:44.157] SYS: Field Elevation Set: 0m
+[22:08:45.185] SYS: Field Elevation Set: 0m
+[22:08:46.215] SYS: Field Elevation Set: 0m
+[22:08:47.254] SYS: Field Elevation Set: 0m
+[22:08:48.284] SYS: Field Elevation Set: 0m
+[22:08:49.309] SYS: Field Elevation Set: 0m
+[22:08:50.328] SYS: Field Elevation Set: 0m
+[22:08:51.211] SYS: Field Elevation Set: 0m
+[22:08:52.389] SYS: Field Elevation Set: 0m
+[22:08:53.417] SYS: Field Elevation Set: 0m
+[22:08:54.297] SYS: Field Elevation Set: 0m
+[22:08:55.330] SYS: Field Elevation Set: 0m
+[22:08:56.372] SYS: Field Elevation Set: 0m
+[22:08:57.260] SYS: Field Elevation Set: 0m
+[22:08:58.435] SYS: Field Elevation Set: 0m
+[22:08:59.315] SYS: Field Elevation Set: 0m
+[22:09:00.343] SYS: Field Elevation Set: 0m
+[22:09:01.376] SYS: Field Elevation Set: 0m
+[22:09:02.409] SYS: Field Elevation Set: 0m
+[22:09:03.295] SYS: Field Elevation Set: 0m
+[22:09:04.328] SYS: Field Elevation Set: 0m
+[22:09:05.361] SYS: Field Elevation Set: 0m
+[22:09:06.372] SYS: Field Elevation Set: 0m
+[22:09:07.497] SYS: Field Elevation Set: 0m
+[22:09:08.433] SYS: Field Elevation Set: 0m
+[22:09:09.316] SYS: Field Elevation Set: 0m
+[22:09:10.485] SYS: Field Elevation Set: 0m
+[22:09:11.513] SYS: Field Elevation Set: 0m
+[22:09:12.393] SYS: Field Elevation Set: 0m
+[22:09:13.421] SYS: Field Elevation Set: 0m
+[22:09:14.454] SYS: Field Elevation Set: 0m
+[22:09:15.482] SYS: Field Elevation Set: 0m
+[22:09:16.362] SYS: Field Elevation Set: 0m
+[22:09:17.542] SYS: Field Elevation Set: 0m
+[22:09:18.423] SYS: Field Elevation Set: 0m
+[22:09:19.445] SYS: Field Elevation Set: 0m
+[22:09:20.481] SYS: Field Elevation Set: 0m
+[22:09:21.514] SYS: Field Elevation Set: 0m
+[22:09:22.400] SYS: Field Elevation Set: 0m
+[22:09:23.425] SYS: Field Elevation Set: 0m
+[22:09:24.463] SYS: Field Elevation Set: 0m
+[22:09:25.344] SYS: Field Elevation Set: 0m
+[22:09:26.513] SYS: Field Elevation Set: 0m
+[22:09:27.540] SYS: Field Elevation Set: 0m
+[22:09:28.415] SYS: Field Elevation Set: 0m
+[22:09:29.571] SYS: Field Elevation Set: 0m
+[22:09:30.601] SYS: Field Elevation Set: 0m
+[22:09:31.470] SYS: Field Elevation Set: 0m
+[22:09:32.489] SYS: Field Elevation Set: 0m
+[22:09:33.667] SYS: Field Elevation Set: 0m
+[22:09:34.550] SYS: Field Elevation Set: 0m
+[22:09:35.433] SYS: Field Elevation Set: 0m
+[22:09:36.450] SYS: Field Elevation Set: 0m
