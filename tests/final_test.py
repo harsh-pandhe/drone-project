@@ -31,7 +31,6 @@ async def run():
                 return True
                 
     try:
-        # Wait for the connection check to return True, with a timeout
         await asyncio.wait_for(wait_for_connection(), timeout=20.0)
         
         print("   -> HEARTBEAT RECEIVED!")
