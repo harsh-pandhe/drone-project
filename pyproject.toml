@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drone-project"
+version = "0.1.0"
+description = "Autonomous drone control platform with MAVLink and Pixhawk support"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "harsh-pandhe", email = "harshpandhehome@gmail.com"}
+]
+keywords = ["drone", "pixhawk", "mavlink", "quadcopter", "robotics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Robotics",
+]
+
+dependencies = [
+    "pymavlink>=2.4.0",
+    "mavsdk>=1.4.0",
+    "flask>=3.0.0",
+    "flask-socketio>=5.0.0",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "flake8>=5.0",
+    "isort>=5.0",
+]
+ros = [
+    "rclpy>=0.13.0",
+    "nav-msgs>=0.13.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/harsh-pandhe/drone-project"
+Repository = "https://github.com/harsh-pandhe/drone-project.git"
+Issues = "https://github.com/harsh-pandhe/drone-project/issues"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

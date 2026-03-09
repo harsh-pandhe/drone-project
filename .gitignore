@@ -1,18 +1,45 @@
 # Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 
 # Virtual environment
 ascend_env/
+venv/
+env/
 
-# Data directories
+# Data directories (large, generated locally)
 data/
 
-# Logs
+# Logs and event files
 *.log
+events_*.txt
+telemetry_*.csv
 
-# Other build artifacts
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Test and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Other models and binaries
 *.tflite
 
-# OS files
-.DS_Store
+# Misc
+*.tlog
+*.tlog.raw
