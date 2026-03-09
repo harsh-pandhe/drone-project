@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+ascend_env/
+
+# Data directories
+data/
+
+# Logs
+*.log
+
+# Other build artifacts
+*.tflite
+
+# OS files
+.DS_Store
