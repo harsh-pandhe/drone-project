@@ -10,11 +10,23 @@ build/
 ascend_env/
 venv/
 env/
+*env/
+.venv/
 
-# Logs
+# Logs and data
 *.log
+*.csv
+diag_*.txt
+telemetry_*.csv
+events_*.txt
+data/
+src/data/
 
-# IDE and editor
+# Test outputs
+tests/output/
+*.pcd
+*.bin
+
 .vscode/
 .idea/
 *.swp
