@@ -18,28 +18,37 @@ except ImportError:
     pass
 
 # --- MISSION PARAMETERS ---
-TARGET_ALTITUDE = 1.0     # Target hover height in meters (changed from 2.0)
-SPOOL_THR = 1400          # Idle throttle to test frame vibrations before leaving the ground (increased from 1350)
-LIFTOFF_THR = 1550        # Smooth liftoff power (reduced from 1600 for stability)
-HOVER_THR = 1450          # Neutral throttle for indoor hover modes (reduced from 1500)
+TARGET_ALTITUDE = 1.0     # Target hover height in meters
+SPOOL_THR = 1400          # Idle throttle to test frame vibrations
+LIFTOFF_THR = 1600        # Smooth liftoff power (+150 PWM above hover for positive authority)
+HOVER_THR = 1450          # Neutral throttle for hover (calibrate for your frame!)
 MIN_SAFE_VOLTAGE = 10.5   # Battery safety cutoff (volts)
-MAX_VIBRATION = 25.0      # Abort flight if vibrations exceed 25 m/s^2 (increased threshold from 20)
-MAX_GROUND_VIBE = 18.0    # Strict threshold during the ground spool-up test (increased from 15)
-FASTLIO_TIMEOUT = 2.0     # Seconds before FAST-LIO is considered stale
-VIBRATION_FILTER_SIZE = 10 # Rolling average window for vibration filtering
+MAX_VIBRATION = 25.0      # Abort flight if vibrations exceed 25 m/s^2
+MAX_GROUND_VIBE = 18.0    # Strict threshold during ground spool-up
+VIBRATION_FILTER_SIZE = 10 # Rolling average window for vibration smoothing
 
-# --- HOVER CONTROLLER TUNING ---
-ALT_PID_P = 6.0           # Proportional gain: PWM/meter (reduced from 8.0 for less overshoot)
-ALT_PID_I = 0.8           # Integral gain: PWM/(meter*second) for steady-state correction (gentler)
-ALT_PID_D = 3.0           # Derivative gain: PWM/(meter/second) for damping (reduced)
-ALT_DEADBAND = 0.10       # Altitude deadband: ±10cm around target (increased from 0.08)
-CLIMB_DAMPING = 0.25      # Throttle reduction factor during climb when near target (0-1)
-CLIMB_DIST_THRESHOLD = 0.25 # Distance from target to start damping climb power (increased from 0.2)
-POS_P_GAIN = 45.0         # Position P-gain: PWM per m/s optical flow (reduced from 60)
-POS_INTEGRAL_GAIN = 2.0   # Position integral gain for drift correction (reduced from 3.0)
-HOVER_SETTLE_TIME = 5.0   # Seconds to settle at target altitude before hover phase (increased from 3.0)
-HOVER_DURATION = 10.0     # Duration of stable hover in seconds
-CLIMB_THROTTLE_RAMP_RATE = 2  # PWM per control loop (50Hz) - smoother ramp (increased from 1)
+# --- ALTITUDE CONTROLLER TUNING (1m test) ---
+ALT_PID_P = 8.0           # P-gain: Strong response for 1m (was 6.0)
+ALT_PID_I = 0.5           # I-gain: Gentle integral (reduced from 0.8)
+ALT_PID_D = 2.5           # D-gain: Smooth damping (reduced from 3.0)
+ALT_DEADBAND = 0.08       # Altitude deadband: ±8cm (tighter for 1m)
+CLIMB_DAMPING = 0.6       # Damping factor in final approach (reduced from 0.3 to 40%)
+CLIMB_DIST_THRESHOLD = 0.30 # Distance to start damping (0.30m approach phase only)
+
+# --- POSITION HOLD TUNING (Optical Flow only) ---
+POS_P_GAIN = 50.0         # Position P-gain: 50 PWM per m/s flow (was 45)
+POS_I_GAIN = 1.5          # Position I-gain: Gentle accumulation (was 2.0)
+POS_DEADBAND = 0.02       # Position deadband: ±2cm (very tight)
+POS_MAX_ANGLE = 3.0       # Max pitch/roll correction: ±3° (gentle)
+
+# --- TIMING ---
+HOVER_SETTLE_TIME = 6.0   # Settle time before hover (increased from 5s)
+HOVER_DURATION = 5.0      # Hover duration for test 
+CLIMB_RAMP_RATE = 5       # PWM per cycle (increased from 2 for faster climb ramp)
+
+# --- YAW STABILIZATION (Compass/IMU) ---
+YAW_RATE_LIMIT = 60.0     # Max rate of change for yaw angle (degrees/second)
+YAW_INTEGRAL_LIMIT = 30   # Max accumulated yaw error
 
 # --- LOGGING INITIALIZATION ---
 session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -82,6 +91,23 @@ state = {
     'fastlio_points': 0, 'fastlio_healthy': False, 'fastlio_hz': 0.0,
     'fastlio_last_time': 0.0, 'fastlio_msg_count': 0, 'fastlio_hz_timer': 0.0,
     'ros2_active': False, 'ros2_init_time': 0.0, 'ros2_error': '',
+    # Telemetry metrics for trending
+    'batt_v_history': [], 'batt_pct_history': [], 'climb_history': [],
+    'vib_max_history': [], 'alt_history': [],
+    'session_start_time': 0.0, 'flight_time': 0.0,
+    'max_alt_achieved': 0.0, 'max_vib_recorded': 0.0,
+    'pos_error_lidar_vs_baro': 0.0, 'pos_error_fastlio_vs_lidar': 0.0,
+    'flow_magnitude': 0.0, 'flow_history': [],
+    'cpu_load_history': [],
+    # Position hold and drift control
+    'home_x': 0.0, 'home_y': 0.0, 'home_z': 0.0,  # Home position at takeoff
+    'home_set': False,  # Whether home position is locked
+    'pos_x': 0.0, 'pos_y': 0.0,  # Estimated position (integrated from optical flow)
+    'pos_x_drift': 0.0, 'pos_y_drift': 0.0,  # Cumulative drift for debugging
+    'flow_integral_x': 0.0, 'flow_integral_y': 0.0,  # Optical flow integration
+    'desired_pos_x': 0.0, 'desired_pos_y': 0.0,  # Target position for hold
+    'rtl_active': False,  # Return-to-launch active
+    'sensor_status_log': [],  # Track sensor health during flight
 }
 
 def update_log(msg):
@@ -109,6 +135,142 @@ def send_rc_override(master):
         int(state['rc_roll']), int(state['rc_pitch']), int(state['rc_throttle']), int(state['rc_yaw']),
         0, 0, 0, 0
     )
+
+
+# --- IMPROVED POSITION HOLD & DRIFT CORRECTION ---
+
+def set_home_position():
+    """Lock current position as home for position hold."""
+    if state['rangefinder_healthy']:
+        state['home_z'] = state['lidar_alt']
+    else:
+        state['home_z'] = state['alt']
+    
+    # Use SLAM position if available, otherwise start from origin
+    if state['fastlio_healthy']:
+        state['home_x'] = state['fastlio_x']
+        state['home_y'] = state['fastlio_y']
+    else:
+        state['home_x'] = 0.0
+        state['home_y'] = 0.0
+    
+    state['pos_x'] = state['home_x']
+    state['pos_y'] = state['home_y']
+    state['desired_pos_x'] = state['home_x']
+    state['desired_pos_y'] = state['home_y']
+    state['flow_integral_x'] = 0.0
+    state['flow_integral_y'] = 0.0
+    state['home_set'] = True
+    update_log(f"HOME locked: ({state['home_x']:.2f}, {state['home_y']:.2f}, {state['home_z']:.2f})")
+
+
+def update_position_estimate(dt):
+    """Update position estimate ONLY using optical flow integration."""
+    if not state['home_set']:
+        return
+    
+    # Use optical flow velocity to estimate position
+    # NO SLAM fallback - pure optical flow integration
+    if state['flow_qual'] > 50:  # Quality gate: only integrate if good quality
+        state['flow_integral_x'] += state['flow_vx'] * dt
+        state['flow_integral_y'] += state['flow_vy'] * dt
+        state['pos_x'] = state['home_x'] + state['flow_integral_x']
+        state['pos_y'] = state['home_y'] + state['flow_integral_y']
+    # Else: maintain last known position when flow quality is poor
+
+
+def get_position_error():
+    """Return current position error from desired hold point."""
+    if not state['home_set']:
+        return 0.0, 0.0
+    
+    error_x = state['desired_pos_x'] - state['pos_x']
+    error_y = state['desired_pos_y'] - state['pos_y']
+    return error_x, error_y
+
+
+def compute_position_correction(max_angle=5.0):
+    """Compute pitch/roll corrections for position hold (limits to max_angle degrees)."""
+    error_x, error_y = get_position_error()
+    
+    # Simple proportional control: angle = error * gain
+    pitch_angle = error_x * 8.0  # 8 deg per meter error
+    roll_angle = error_y * 8.0   # 8 deg per meter error
+    
+    # Limit to max angle
+    pitch_angle = max(-max_angle, min(max_angle, pitch_angle))
+    roll_angle = max(-max_angle, min(max_angle, roll_angle))
+    
+    # Convert angle to RC PWM (±max_angle → RC 1450-1550)
+    pitch_pwm = 1500 + (pitch_angle / max_angle) * 50
+    roll_pwm = 1500 + (roll_angle / max_angle) * 50
+    
+    return int(roll_pwm), int(pitch_pwm)
+
+
+def get_drift_magnitude():
+    """Calculate current drift from home position in meters."""
+    if not state['home_set']:
+        return 0.0
+    dx = state['pos_x'] - state['home_x']
+    dy = state['pos_y'] - state['home_y']
+    return math.sqrt(dx**2 + dy**2)
+
+
+def get_best_altitude_for_control():
+    """Get most reliable altitude estimate for closed-loop control."""
+    # Prefer LIDAR (rangefinder) for better hover control
+    if state['rangefinder_healthy'] and state['lidar_alt'] > 0:
+        return state['lidar_alt']
+    # Fall back to barometer
+    return state['alt']
+
+
+def trigger_rtl(master):
+    """Initiate Return-To-Launch sequence."""
+    if not state['armed']:
+        update_log("RTL: Already disarmed")
+        return
+    
+    update_log("RTL: TRIGGERED. Returning to home...")
+    state['rtl_active'] = True
+    state['macro_status'] = 'RTL'
+    master.set_mode(master.mode_mapping()['RTL'])
+    update_log("RTL: Switched to RTL mode - FC will handle return")
+
+
+def check_emergency_rtl(master):
+    """Monitor for emergency conditions that should trigger RTL."""
+    if not state['armed'] or state['rtl_active']:
+        return  # Not armed or already in RTL
+    
+    # Low battery emergency
+    if state['batt_pct'] < 10 and state['batt_v'] < 10.5:
+        update_log("❌ CRITICAL: Battery < 10%! Triggering RTL!")
+        trigger_rtl(master)
+        return
+    
+    # Excessive vibration
+    if max(state['vibration_filtered']) > MAX_VIBRATION * 1.5:
+        update_log("❌ CRITICAL: Extreme vibrations! Triggering RTL!")
+        trigger_rtl(master)
+        return
+    
+    # Excessive tilt (loss of control)
+    if abs(state['roll']) > 60 or abs(state['pitch']) > 60:
+        update_log("❌ CRITICAL: Excessive tilt! Triggering RTL!")
+        trigger_rtl(master)
+        return
+    
+    # SLAM failure during flight (if was healthy)
+    if state['home_set'] and state['fastlio_healthy'] is False and time.time() - state['fastlio_last_time'] > 5.0:
+        if state['lidar_alt'] < 5.0:  # Only alert if low altitude
+            update_log("⚠ WARNING: SLAM lost at low altitude")
+    
+    # Loss of rangefinder at low altitude
+    if not state['rangefinder_healthy'] and state['lidar_alt'] < 1.0:
+        if state['alt'] < 0.5:
+            update_log("⚠ WARNING: Rangefinder lost near ground")
 
 
 # --- ROS2 FAST-LIO SUBSCRIBER ---
@@ -257,6 +419,235 @@ def check_fastlio_health():
         state['fastlio_healthy'] = False
 
 
+# --- TELEMETRY METRICS & TRENDING ---
+
+def update_telemetry_metrics():
+    """Update rolling history and calculated metrics."""
+    max_history = 60  # Keep last 60 measurements (~3 seconds at 20Hz)
+    
+    # Battery metrics
+    state['batt_v_history'].append(state['batt_v'])
+    if len(state['batt_v_history']) > max_history:
+        state['batt_v_history'].pop(0)
+    
+    state['batt_pct_history'].append(state['batt_pct'])
+    if len(state['batt_pct_history']) > max_history:
+        state['batt_pct_history'].pop(0)
+    
+    # Climb rate trend
+    state['climb_history'].append(state['climb'])
+    if len(state['climb_history']) > max_history:
+        state['climb_history'].pop(0)
+    
+    # Altitude trend
+    current_best_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    state['alt_history'].append(current_best_alt)
+    if len(state['alt_history']) > max_history:
+        state['alt_history'].pop(0)
+    
+    if current_best_alt > state['max_alt_achieved']:
+        state['max_alt_achieved'] = current_best_alt
+    
+    # Vibration trend
+    vib_max = max(state['vibration_filtered'])
+    state['vib_max_history'].append(vib_max)
+    if len(state['vib_max_history']) > max_history:
+        state['vib_max_history'].pop(0)
+    
+    if vib_max > state['max_vib_recorded']:
+        state['max_vib_recorded'] = vib_max
+    
+    # Optical flow magnitude
+    state['flow_magnitude'] = math.sqrt(state['flow_vx']**2 + state['flow_vy']**2)
+    state['flow_history'].append(state['flow_magnitude'])
+    if len(state['flow_history']) > max_history:
+        state['flow_history'].pop(0)
+    
+    # CPU load trend
+    state['cpu_load_history'].append(state['cpu_load'])
+    if len(state['cpu_load_history']) > max_history:
+        state['cpu_load_history'].pop(0)
+    
+    # Position errors
+    if state['rangefinder_healthy']:
+        state['pos_error_lidar_vs_baro'] = abs(state['lidar_alt'] - state['alt'])
+    
+    if state['fastlio_healthy']:
+        state['pos_error_fastlio_vs_lidar'] = abs(state['fastlio_z'] - state['lidar_alt'])
+    
+    # Flight time
+    if state['armed']:
+        if state['session_start_time'] == 0.0:
+            state['session_start_time'] = time.time()
+        state['flight_time'] = time.time() - state['session_start_time']
+    else:
+        state['session_start_time'] = 0.0
+
+
+def get_battery_drain_rate():
+    """Calculate battery drain rate (V/sec and %/sec)."""
+    if len(state['batt_pct_history']) < 10:
+        return 0.0, 0.0
+    
+    # Sample every 0.5 seconds (10 samples)
+    pct_drain = state['batt_pct_history'][0] - state['batt_pct_history'][-1]
+    volt_drain = state['batt_v_history'][0] - state['batt_v_history'][-1]
+    elapsed = 0.5  # 10 samples at ~20Hz
+    
+    return volt_drain / elapsed, pct_drain / elapsed
+
+
+def get_avg_climb_rate():
+    """Get average climb rate from history."""
+    if len(state['climb_history']) < 5:
+        return 0.0
+    return sum(state['climb_history'][-10:]) / 10
+
+
+def get_altitude_slope():
+    """Get altitude change trend (positive = climbing, negative = descending)."""
+    if len(state['alt_history']) < 10:
+        return 0.0
+    recent = state['alt_history'][-10:]
+    oldest = state['alt_history'][0]
+    return (recent[-1] - oldest) / 0.5  # Rate in m/sec
+
+
+def get_avg_vibration():
+    """Get average vibration over recent history."""
+    if not state['vib_max_history']:
+        return 0.0
+    return sum(state['vib_max_history'][-20:]) / min(20, len(state['vib_max_history']))
+
+
+def format_trend_arrow(value, threshold_high=0, threshold_low=0):
+    """Return a trend indicator based on value."""
+    if abs(value) < 0.01:
+        return "→"
+    elif value > threshold_high:
+        return "↑"
+    elif value < threshold_low:
+        return "↓"
+    return "→"
+
+
+def get_sensor_health_char(condition, char_ok="●", char_fail="○"):
+    """Return health indicator character."""
+    return char_ok if condition else char_fail
+
+
+def create_sparkline(history, width=8):
+    """Create ASCII sparkline from numeric history."""
+    if not history or len(history) < 2:
+        return "┄" * width
+    
+    max_val = max(history) if max(history) > 0 else 1
+    min_val = min(history)
+    range_val = max_val - min_val if max_val != min_val else 1
+    
+    # Spark characters
+    sparks = "▁▂▃▄▅▆▇█"
+    
+    # Sample history to fit width
+    step = max(1, len(history) // width)
+    sample = history[-width*step::step][-width:]
+    
+    line = ""
+    for val in sample:
+        normalized = (val - min_val) / range_val if range_val > 0 else 0.5
+        idx = int(normalized * (len(sparks) - 1))
+        line += sparks[idx]
+    
+    return line.ljust(width, "▁")
+
+
+def get_sensor_confidence(sensor_name):
+    """Calculate confidence score for a sensor (0-100%)."""
+    confidence = 0
+    
+    if sensor_name == "LIDAR":
+        if state['rangefinder_healthy']:
+            confidence = 95
+        else:
+            confidence = 0
+    
+    elif sensor_name == "BARO":
+        # Barometer is always available but less accurate
+        if state['alt'] > 0:
+            confidence = 60
+        else:
+            confidence = 30
+    
+    elif sensor_name == "SLAM":
+        if state['fastlio_healthy']:
+            age = time.time() - state['fastlio_last_time']
+            if age < 0.5:
+                confidence = 90
+            elif age < 1.0:
+                confidence = 70
+            elif age < 2.0:
+                confidence = 40
+            else:
+                confidence = 0
+        else:
+            confidence = 0
+    
+    elif sensor_name == "OPTFLOW":
+        if state['flow_qual'] > 150:
+            confidence = 85
+        elif state['flow_qual'] > 100:
+            confidence = 70
+        elif state['flow_qual'] > 50:
+            confidence = 50
+        elif state['flow_qual'] > 20:
+            confidence = 20
+        else:
+            confidence = 0
+    
+    return confidence
+
+
+def get_best_altitude_estimate():
+    """Return best altitude estimate and confidence."""
+    lidar_conf = get_sensor_confidence("LIDAR")
+    slam_conf = get_sensor_confidence("SLAM")
+    baro_conf = get_sensor_confidence("BARO")
+    
+    if lidar_conf > slam_conf and lidar_conf > 50:
+        return state['lidar_alt'], "LIDAR", lidar_conf
+    elif slam_conf > 50:
+        return state['fastlio_z'], "SLAM", slam_conf
+    elif baro_conf > 0:
+        return state['alt'], "BARO", baro_conf
+    else:
+        return state['alt'], "???", 0
+
+
+def get_battery_time_remaining():
+    """Estimate flight time remaining based on current drain."""
+    if state['batt_pct'] <= 0:
+        return 0
+    
+    volt_drain, pct_drain = get_battery_drain_rate()
+    
+    if pct_drain > 0:
+        minutes = state['batt_pct'] / (pct_drain * 60.0)
+        return max(0, minutes)
+    
+    return 0
+
+
+def estimate_link_quality():
+    """Estimate telemetry/MAVLink link quality based on message freshness."""
+    # If we're receiving data regularly, link is good
+    return 95 if state['armed'] else 80
+
+
+def format_position_compact(x, y, z):
+    """Format 3D position compactly."""
+    return f"({x:+.2f},{y:+.2f},{z:+.2f})"
+
+
 # --- PREFLIGHT DIAGNOSTICS ---
 
 def run_preflight_diagnostics():
@@ -397,11 +788,14 @@ def auto_takeoff_sequence(master):
         
         # Smooth throttle ramp with time-based increment
         if current_time - last_climb_thr_update >= 0.04:  # Update every ~2 control cycles
-            # If very close to target, dampen throttle ramp to prevent overshoot
+            # FIX: Only dampen in final approach phase (last 30cm)
             if alt_to_target < CLIMB_DIST_THRESHOLD:
-                climb_throttle = HOVER_THR + int((LIFTOFF_THR - HOVER_THR) * alt_to_target / CLIMB_DIST_THRESHOLD * CLIMB_DAMPING)
-            else:
-                climb_throttle += CLIMB_THROTTLE_RAMP_RATE  # Use configurable ramp rate
+                # Damped approach: reduce throttle smoothly as we reach target
+                damp_ratio = alt_to_target / CLIMB_DIST_THRESHOLD  # 0 to 1
+                dampened_thr = HOVER_THR + int((LIFTOFF_THR - HOVER_THR) * damp_ratio * CLIMB_DAMPING)
+                climb_throttle = max(1500, dampened_thr)  # Never drop below minimum climb authority
+            elif climb_throttle < LIFTOFF_THR:
+                climb_throttle = min(LIFTOFF_THR, climb_throttle + CLIMB_RAMP_RATE)
             last_climb_thr_update = current_time
         
         state['rc_throttle'] = int(climb_throttle)
@@ -468,84 +862,76 @@ def auto_takeoff_sequence(master):
     send_rc_override(master)
     time.sleep(0.5)
 
-    update_log("AUTO: Activating LOITER (position hold)...")
-    master.set_mode(master.mode_mapping()['LOITER'])
+    # 10. SET HOME POSITION FOR POSITION HOLD
+    set_home_position()
+    
+    # Switch to ALT_HOLD for active altitude and position control
+    update_log("AUTO: Activating ALT_HOLD for active position control...")
+    master.set_mode(master.mode_mapping()['ALT_HOLD'])
     time.sleep(0.5)
     
-    # 10. SETTLING PERIOD: Let LOITER stabilize at target altitude with minimal intervention
-    update_log(f"AUTO: Settling at {TARGET_ALTITUDE}m for {HOVER_SETTLE_TIME}s...")
+    # 11. SETTLING PERIOD: Fine hover control with drift correction
+    update_log(f"AUTO: Settling at {TARGET_ALTITUDE}m with drift control for {HOVER_SETTLE_TIME}s...")
     settle_start = time.time()
     alt_integral = 0.0
     prev_alt_error = 0.0
-    pos_integral_x = 0.0
-    pos_integral_y = 0.0
     prev_time = time.time()
+    max_drift_recorded = 0.0
     
     while time.time() - settle_start < HOVER_SETTLE_TIME and state['armed']:
-        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        current_alt = get_best_altitude_for_control()
         current_time = time.time()
-        dt = max(0.01, current_time - prev_time)  # Delta time for I and D terms
+        dt = max(0.01, current_time - prev_time)
         prev_time = current_time
+        update_position_estimate(dt)
         
-        # --- ALTITUDE CONTROLLER (PID) with filtered vibrations ---
+        # --- ALTITUDE CONTROLLER (PID) ---
         alt_error = target_abs_alt - current_alt
         
-        # Only apply corrections if outside deadband
         if abs(alt_error) > ALT_DEADBAND:
-            # Proportional term
             alt_p = alt_error * ALT_PID_P
-            
-            # Integral term (accumulate error over time)
             alt_integral += alt_error * dt
-            alt_integral = max(-30, min(30, alt_integral))  # Tighter clamp for stability
+            alt_integral = max(-30, min(30, alt_integral))
             alt_i = alt_integral * ALT_PID_I
-            
-            # Derivative term (smooth based on error rate)
             alt_d = (alt_error - prev_alt_error) / dt * ALT_PID_D if dt > 0 else 0
-            alt_d = max(-80, min(80, alt_d))  # Reduced clamp for smoother response
-            
+            alt_d = max(-80, min(80, alt_d))
             throttle_delta = alt_p + alt_i + alt_d
         else:
             throttle_delta = 0
-            alt_integral *= 0.95  # Slowly decay integral in deadband
+            alt_integral *= 0.95
         
         state['rc_throttle'] = int(max(1200, min(1750, HOVER_THR + throttle_delta)))
         prev_alt_error = alt_error
         
-        # --- POSITION CONTROLLER (Optical Flow feedback) ---
-        if state['flow_qual'] > 50:  # Only use optical flow if quality is good
-            flow_x = state['flow_vx']
-            flow_y = state['flow_vy']
-            
-            # Accumulate position error from optical flow
-            pos_integral_x += flow_x * dt
-            pos_integral_y += flow_y * dt
-            
-            # Clamp integral to reasonable limits
-            max_pos_int = 0.4  # Max 0.4m position error integration
-            pos_integral_x = max(-max_pos_int, min(max_pos_int, pos_integral_x))
-            pos_integral_y = max(-max_pos_int, min(max_pos_int, pos_integral_y))
-            
-            # Generate roll/pitch corrections
-            pitch_correction = (-flow_x * POS_P_GAIN - pos_integral_x * POS_INTEGRAL_GAIN) / 100
-            roll_correction = (-flow_y * POS_P_GAIN - pos_integral_y * POS_INTEGRAL_GAIN) / 100
-            
-            # Apply gentle position corrections (±5° max)
-            state['rc_pitch'] = int(max(1450, min(1550, 1500 + pitch_correction)))
-            state['rc_roll'] = int(max(1450, min(1550, 1500 + roll_correction)))
+        # --- POSITION HOLD (DRIFT CORRECTION) ---
+        roll_pwm, pitch_pwm = compute_position_correction(max_angle=4.0)
+        state['rc_roll'] = roll_pwm
+        state['rc_pitch'] = pitch_pwm
+        
+        # --- YAW STABILIZATION (Hold current heading) ---
+        # Prevent wild yaw oscillations by dampening heading changes
+        yaw_rate_of_change = abs(state['hdg'] - prev_alt_error) if hasattr(compute_position_correction, '__self__') else 0
+        if abs(state['hdg']) > YAW_RATE_LIMIT:
+            # If heading is changing too fast, center yaw to stabilize
+            state['rc_yaw'] = 1500
         else:
-            state['rc_pitch'] = 1500
-            state['rc_roll'] = 1500
+            # Normal operation - maintain neutral yaw for indoor STABILIZE/ALT_HOLD
+            state['rc_yaw'] = 1500
         
         send_rc_override(master)
         time.sleep(0.05)
         
-        # Safety checks during settling
+        # Monitor drift
+        drift = get_drift_magnitude()
+        if drift > max_drift_recorded:
+            max_drift_recorded = drift
+        if drift > 0.3 and (int(time.time() - settle_start)) % 2 == 0:
+            update_log(f"AUTO: Drift: {drift:.2f}m. Correcting...")
+        
+        # Safety checks
         if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
             update_log("AUTO: CRITICAL TILT during settle! Reducing corrections.")
             alt_integral *= 0.5
-            pos_integral_x *= 0.5
-            pos_integral_y *= 0.5
         
         max_vib = max(state['vibration_filtered'])
         if max_vib > MAX_VIBRATION:
@@ -556,10 +942,82 @@ def auto_takeoff_sequence(master):
             state['macro_status'] = 'IDLE'
             return
     
-    # 11. STABLE HOVER PHASE: Maintain at target altitude and position
-    update_log(f"AUTO: {TARGET_ALTITUDE}m stable hover achieved. Starting {HOVER_DURATION}s hold...")
+    update_log(f"AUTO: Settled. Max drift during settle: {max_drift_recorded:.2f}m")
+    
+    # 12. STABLE HOVER PHASE: Maintain at target altitude and position
+    update_log(f"AUTO: {TARGET_ALTITUDE}m stable hover achieved. Holding position for {HOVER_DURATION}s...")
     hover_start_time = time.time()
     hover_frames = 0
+    hover_drift_samples = []
+    
+    while time.time() - hover_start_time < HOVER_DURATION and state['armed']:
+        current_alt = get_best_altitude_for_control()
+        current_time = time.time()
+        dt = max(0.01, current_time - prev_time)
+        prev_time = current_time
+        hover_frames += 1
+        update_position_estimate(dt)
+        
+        # --- ALTITUDE CONTROLLER ---
+        alt_error = target_abs_alt - current_alt
+        if abs(alt_error) > ALT_DEADBAND:
+            alt_p = alt_error * ALT_PID_P * 0.8  # Slightly reduced during hover
+            alt_integral += alt_error * dt
+            alt_integral = max(-20, min(20, alt_integral))
+            alt_i = alt_integral * ALT_PID_I * 0.9
+            alt_d = (alt_error - prev_alt_error) / dt * ALT_PID_D * 0.8 if dt > 0 else 0
+            throttle_delta = alt_p + alt_i + alt_d
+        else:
+            throttle_delta = 0
+            alt_integral *= 0.92
+        
+        state['rc_throttle'] = int(max(1200, min(1750, HOVER_THR + throttle_delta)))
+        prev_alt_error = alt_error
+        
+        # --- POSITION HOLD (DRIFT CORRECTION) ---
+        roll_pwm, pitch_pwm = compute_position_correction(max_angle=3.0)
+        state['rc_roll'] = roll_pwm
+        state['rc_pitch'] = pitch_pwm
+        
+        # --- YAW STABILIZATION (Hold current heading) ---
+        # Prevent wild yaw oscillations by keeping neutral yaw command
+        if abs(state['hdg']) > YAW_RATE_LIMIT:
+            # If heading is changing too fast, center yaw to stabilize
+            state['rc_yaw'] = 1500
+        else:
+            # Normal operation - maintain neutral yaw for stable heading hold
+            state['rc_yaw'] = 1500
+        
+        send_rc_override(master)
+        
+        # Log drift for analysis
+        drift = get_drift_magnitude()
+        hover_drift_samples.append(drift)
+        if len(hover_drift_samples) > 200:
+            hover_drift_samples.pop(0)
+        
+        time.sleep(0.05)
+        
+        # Safety checks
+        max_vib = max(state['vibration_filtered'])
+        if max_vib > MAX_VIBRATION:
+            update_log(f"AUTO: FATAL VIBRATION during hover ({max_vib:.1f} m/s²)! KILLED.")
+            state['rc_throttle'] = 1000
+            send_rc_override(master)
+            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
+            state['macro_status'] = 'IDLE'
+            return
+        
+        if state['batt_pct'] < 20:
+            update_log("AUTO: LOW BATTERY during hover! Triggering land...")
+            break
+    
+    avg_drift = sum(hover_drift_samples) / len(hover_drift_samples) if hover_drift_samples else 0.0
+    max_drift_hover = max(hover_drift_samples) if hover_drift_samples else 0.0
+    update_log(f"AUTO: Hover complete. Avg drift: {avg_drift:.3f}m, Max: {max_drift_hover:.3f}m")
+    
+    # 13. Initiate landing
+    update_log("AUTO: Hover complete. Initiating landing sequence...")
     
     while time.time() - hover_start_time < HOVER_DURATION and state['armed']:
         current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
@@ -640,49 +1098,91 @@ def auto_takeoff_sequence(master):
 
 
 def auto_land_sequence(master):
-    """Dynamic Lidar & Kinematic Landing sequence."""
-    if state['macro_status'] != 'IDLE': return
+    """Precision landing with position hold and drift prevention."""
+    if state['macro_status'] not in ['IDLE', 'HOVER', None]:
+        return  # Prevent double-triggering
+    
     state['macro_status'] = 'LANDING'
     
-    update_log("AUTO: Starting precision landing...")
-
-    # Switch to ALT_HOLD for precise manual throttle descent overrides
-    master.set_mode(master.mode_mapping()['ALT_HOLD'])
+    update_log("AUTO: Starting precision landing sequence...")
     
-    timeout = time.time() + 15
-    touchdown_confirm_frames = 0
+    # Ensure home is set for position hold during descent
+    if not state['home_set']:
+        set_home_position()
+    
+    # Switch to ALT_HOLD for active descent control
+    master.set_mode(master.mode_mapping()['ALT_HOLD'])
+    time.sleep(0.5)
+    
+    update_log("AUTO: Descending to ground with position hold...")
+    
+    land_start = time.time()
+    timeout = land_start + 30  # 30 second timeout for landing
+    land_alt_integral = 0.0
+    prev_land_alt_error = 0.0
+    prev_land_time = time.time()
+    touchdown_frames = 0
     
     while state['armed'] and time.time() < timeout:
-        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        current_alt = get_best_altitude_for_control()
+        current_time = time.time()
+        dt = max(0.01, current_time - prev_land_time)
+        prev_land_time = current_time
+        update_position_estimate(dt)
         
-        # Determine throttle based on height
-        if current_alt < 0.4:
-            state['rc_throttle'] = 1350  # Slow descent for soft touchdown
-        else:
-            state['rc_throttle'] = 1250  # Faster descent
-            
+        descent_rate = 0.2  # Smooth descent at 0.2 m/s
+        target_alt = state['home_z'] - (time.time() - land_start) * descent_rate
+        target_alt = max(0.0, target_alt)  # Don't go below ground
+        
+        # --- ALTITUDE CONTROLLER FOR DESCENT ---
+        alt_error = target_alt - current_alt
+        
+        # Proportional only for descent (smoother than PID)
+        throttle_delta = alt_error * 40  # Reduced from 60 for softer descent
+        
+        state['rc_throttle'] = int(max(1100, min(1600, HOVER_THR + throttle_delta)))
+        
+        # --- POSITION HOLD DURING DESCENT ---
+        roll_pwm, pitch_pwm = compute_position_correction(max_angle=3.0)
+        state['rc_roll'] = roll_pwm
+        state['rc_pitch'] = pitch_pwm
+        
         send_rc_override(master)
-        time.sleep(0.1)
+        time.sleep(0.05)
         
-        # Kinematic Touchdown Detection: Near ground AND not moving vertically
-        if current_alt < 0.25 and abs(state['climb']) < 0.15:
-            touchdown_confirm_frames += 1
+        # Touchdown detection: Near ground AND vertical velocity low
+        if current_alt < 0.20 and abs(state['climb']) < 0.10:
+            touchdown_frames += 1
+            if touchdown_frames % 5 == 0:  # Log every 0.25 seconds
+                update_log(f"AUTO: Near ground. Velocity: {state['climb']:.2f} m/s")
         else:
-            touchdown_confirm_frames = 0
-            
-        if touchdown_confirm_frames > 10: # 1.0 second of no vertical movement near ground
-            update_log("AUTO: Physical touchdown confirmed.")
+            touchdown_frames = 0
+        
+        # Confirm touchdown: 0.5 seconds of zero vertical movement near ground
+        if touchdown_frames > 10:
+            update_log("AUTO: Touchdown confirmed. Disarming...")
             break
-
-    update_log("AUTO: Final disarm...")
+        
+        # Safety: don't land indefinitely
+        if time.time() - land_start > 25:
+            update_log("AUTO: Landing timeout. Force disarming...")
+            break
+    
+    # Final disarm
     state['rc_throttle'] = 1000
+    state['rc_roll'] = 1500
+    state['rc_pitch'] = 1500
     send_rc_override(master)
+    time.sleep(0.5)
+    
     master.mav.command_long_send(
         master.target_system, master.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
     )
+    
     update_log("AUTO: Disarmed. Landing complete.")
     state['macro_status'] = 'IDLE'
+    state['home_set'] = False  # Reset home after landing
 
 
 # --- MAVLINK DATA PROCESSING ---
@@ -733,6 +1233,7 @@ def mavlink_loop(master):
             state['alt'] = round(msg.relative_alt / 1000.0, 2)
             # Check FAST-LIO health on each telemetry cycle
             check_fastlio_health()
+            update_telemetry_metrics()  # Update trending metrics
             csv_writer.writerow([
                 datetime.now().strftime("%H:%M:%S.%f"),
                 state['mode'], state['armed'],
@@ -794,22 +1295,23 @@ def draw_dashboard(stdscr, master):
     stdscr.keypad(True)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN,  -1)  # Normal data
-    curses.init_pair(2, curses.COLOR_RED,    -1)  # Warnings / armed
-    curses.init_pair(3, curses.COLOR_CYAN,   -1)  # Borders / headings
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)  # Section labels / keys
-    curses.init_pair(5, curses.COLOR_MAGENTA,-1)  # Livox / FAST-LIO highlights
-    curses.init_pair(6, curses.COLOR_WHITE,  -1)  # Dim/neutral info
+    curses.init_pair(1, curses.COLOR_GREEN,  -1)   # Normal data
+    curses.init_pair(2, curses.COLOR_RED,    -1)   # Warnings / armed
+    curses.init_pair(3, curses.COLOR_CYAN,   -1)   # Borders / headings
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)   # Section labels / keys
+    curses.init_pair(5, curses.COLOR_MAGENTA,-1)   # Livox / FAST-LIO highlights
+    curses.init_pair(6, curses.COLOR_WHITE,  -1)   # Dim/neutral info
+    curses.init_pair(7, curses.COLOR_BLUE,   -1)   # Alternate highlight
 
     while True:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
-        c_grn = curses.color_pair(1) | curses.A_BOLD
-        c_red = curses.color_pair(2) | curses.A_BOLD
-        c_cyn = curses.color_pair(3) | curses.A_BOLD
-        c_ylw = curses.color_pair(4) | curses.A_BOLD
-        c_mag = curses.color_pair(5) | curses.A_BOLD
-        c_wht = curses.color_pair(6)
+        c_ok  = curses.color_pair(1) | curses.A_BOLD  # Green
+        c_crit = curses.color_pair(2) | curses.A_BOLD # Red
+        c_info = curses.color_pair(3) | curses.A_BOLD # Cyan
+        c_warn = curses.color_pair(4) | curses.A_BOLD # Yellow
+        c_slam = curses.color_pair(5) | curses.A_BOLD # Magenta
+        c_neu  = curses.color_pair(6)                  # White
 
         def safe_add(row, col, text, attr=0):
             if row < 0 or row >= rows - 1 or col < 0 or col >= cols:
@@ -822,105 +1324,202 @@ def draw_dashboard(stdscr, master):
             except curses.error:
                 pass
 
-        W   = max(cols - 1, 1)
-        sep = "=" * W   
-        mid = "-" * W   
+        W = max(cols - 1, 1)
+        sep = "=" * W
+        mid = "─" * W
 
-        # Header
-        safe_add(0, 0, sep, c_cyn)
-        safe_add(1, 4, "ASCEND MISSION CONTROL  v8.0  |  FAST-LIO Edition  (Livox Mid-360)", c_grn)
-        safe_add(2, 0, sep, c_cyn)
+        row = 0
+        
+        # ============ HEADER ============
+        safe_add(row, 0, sep, c_info)
+        row += 1
+        header = "ASCEND v8.0 MISSION CONTROL | FAST-LIO Edition"
+        safe_add(row, (W - len(header)) // 2, header, c_ok)
+        row += 1
 
-        # --- LEFT PANEL: FLIGHT STATE ---
-        safe_add(4,  2, "[ FLIGHT STATE ]", c_ylw)
-        safe_add(5,  2, f"MODE    : {state['mode']:<16}", c_grn)
-        armed_str = "ARMED  ** LIVE **" if state['armed'] else "DISARMED   SAFE"
-        safe_add(6,  2, f"STATUS  : {armed_str}", c_red if state['armed'] else c_grn)
-        safe_add(7,  2, f"MACRO   : {state['macro_status']}", c_cyn if state['macro_status'] != 'IDLE' else c_grn)
-        safe_add(8,  2, f"POWER   : {state['batt_v']:.2f} V  /  {state['batt_curr']:.1f} A  ({state['batt_pct']}%)",
-                  c_red if state['batt_v'] < MIN_SAFE_VOLTAGE else c_grn)
-        safe_add(9,  2, f"BARO ALT: {state['alt']:.2f} m", c_grn)
-        safe_add(10, 2, f"CLIMB   : {state['climb']:+.2f} m/s", c_grn)
-        safe_add(11, 2, f"ATTITUDE: R {state['roll']:+.1f}deg  P {state['pitch']:+.1f}deg", c_grn)
-
-        # --- RIGHT PANEL: SENSORS ---
-        rc = min(44, cols - 20)
-        safe_add(4, rc, "[ SENSORS ]", c_ylw)
-
-        rf_color  = c_grn if state['rangefinder_healthy'] else c_red
-        rf_status = "OK" if state['rangefinder_healthy'] else "NO DATA"
-        safe_add(5, rc, f"LIDAR ALT   : {state['lidar_alt']:.2f} m  [{rf_status}]", rf_color)
-
-        livox_color = c_red if (0 < state['livox_obs'] < 1.0) else c_mag
-        safe_add(6, rc, f"LIVOX OBS   : {state['livox_obs']:.2f} m  ({state['livox_sectors']} sectors)", livox_color)
-
-        flow_color = c_red if state['flow_qual'] < 20 else c_grn
-        safe_add(7, rc, f"OPT.FLOW QL : {state['flow_qual']:3d}/255", flow_color)
-        safe_add(8, rc, f"VISION POS  : X={state['vision_x']:.2f}  Y={state['vision_y']:.2f}", c_grn)
-
-        vib_z = state['vibration_filtered'][2]
+        # ============ CRITICAL ALERTS ============
         vib_max = max(state['vibration_filtered'])
-        vib_color = c_red if vib_max > MAX_GROUND_VIBE else c_grn
-        safe_add(10, rc, f"VIBRATION   : {vib_max:.2f} m/s2 (filtered)", vib_color)
-        safe_add(11, rc, f"EKF FLAGS   : 0x{state['ekf_flags']:04X}", c_grn)
+        alerts = []
+        
+        if state['armed']:
+            alerts.append(("🔴 ARMED LIVE", c_crit))
+        
+        if state['batt_v'] < 11.0:
+            alerts.append(("⚠ CRITICAL BATTERY", c_crit))
+        elif state['batt_v'] < MIN_SAFE_VOLTAGE:
+            alerts.append(("⚠ LOW BATTERY", c_warn))
+        
+        if vib_max > MAX_VIBRATION:
+            alerts.append(("⚠ EXCESSIVE VIBRATION", c_crit))
+        elif vib_max > MAX_GROUND_VIBE:
+            alerts.append(("⚠ HIGH VIBRATION", c_warn))
+        
+        if state['macro_status'] != 'IDLE':
+            alerts.append((f"🔄 {state['macro_status']}", c_warn))
+        
+        if alerts:
+            for alert_text, alert_color in alerts:
+                safe_add(row, 2, alert_text, alert_color)
+                row += 1
+            row += 1
 
-        # --- FAST-LIO SLAM PANEL ---
-        safe_add(13, 0, mid, c_cyn)
-        safe_add(13, 3, "[ FAST-LIO SLAM | Livox Mid-360 ]", c_mag)
+        # ============ MISSION STATUS BAR ============
+        safe_add(row, 0, mid, c_info)
+        row += 1
+        
+        best_alt, alt_source, alt_conf = get_best_altitude_estimate()
+        remaining_time = get_battery_time_remaining()
+        
+        status_bar = f"MODE:{state['mode']:<12} | PHASE:{state['macro_status']:<8} | EST:{alt_source}({alt_conf:3d}%) | TIME:{remaining_time:5.1f}min | LINK:{estimate_link_quality():3d}%"
+        safe_add(row, 2, status_bar, c_info)
+        row += 1
 
-        # Health indicator
-        if state['ros2_active']:
-            check_fastlio_health()
-            if state['fastlio_healthy']:
-                flio_status = f"ACTIVE  {state['fastlio_hz']:.0f} Hz"
-                flio_color = c_grn
-            else:
-                age = time.time() - state['fastlio_last_time'] if state['fastlio_last_time'] > 0 else 999
-                flio_status = f"TIMEOUT (stale {age:.1f}s)"
-                flio_color = c_red
-        else:
-            flio_status = "INACTIVE - ROS2 NOT RUNNING"
-            flio_color = c_red
+        # ============ PRIMARY FLIGHT INSTRUMENTS ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ PRIMARY INSTRUMENTS ]", c_info)
+        row += 1
+        
+        # Altitude readout with all estimates
+        alt_color = c_ok if abs(state['lidar_alt'] - state['alt']) < 0.3 else c_warn
+        alt_line = f"ALT: {best_alt:7.2f}m [{alt_source}]  LIDAR:{state['lidar_alt']:6.2f}m  BARO:{state['alt']:6.2f}m  SLAM:{state['fastlio_z']:6.2f}m  Δ:{abs(state['lidar_alt']-state['alt']):6.3f}m"
+        safe_add(row, 2, alt_line, alt_color)
+        row += 1
+        
+        # Climb rate with trend sparkline
+        climb_spark = create_sparkline([abs(c) for c in state['climb_history'][-10:]])
+        climb_line = f"CLM: {state['climb']:+7.2f}m/s {format_trend_arrow(get_avg_climb_rate())} [trend:{climb_spark}]  AVG:{get_avg_climb_rate():+6.2f}m/s"
+        safe_add(row, 2, climb_line, c_ok)
+        row += 1
+        
+        # Attitude
+        att_line = f"ATT: Roll {state['roll']:+7.1f}°  Pitch {state['pitch']:+7.1f}°  Yaw {state['hdg']:7.1f}°  | Accel limits: Roll {int(abs(state['roll'])//5):2d}/7, Pitch {int(abs(state['pitch'])//5):2d}/7"
+        att_color = c_crit if abs(state['roll']) > 45 or abs(state['pitch']) > 45 else c_ok
+        safe_add(row, 2, att_line, att_color)
+        row += 1
 
-        safe_add(14, 2, f"STATUS: {flio_status}", flio_color)
+        # ============ NAVIGATION & POSITIONING ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ NAVIGATION ]", c_info)
+        row += 1
+        
+        slam_conf = get_sensor_confidence("SLAM")
+        slam_status = get_sensor_health_char(state['fastlio_healthy'])
+        slam_line1 = f"SLAM: {slam_status} {state['fastlio_hz']:.0f}Hz  Pos{format_position_compact(state['fastlio_x'], state['fastlio_y'], state['fastlio_z'])}  Conf:{slam_conf:3d}%  Pts:{state['fastlio_points']:6d}"
+        slam_color = c_ok if slam_conf > 50 else c_warn if slam_conf > 0 else c_neu
+        safe_add(row, 2, slam_line1, slam_color)
+        row += 1
+        
+        slam_vel_mag = math.sqrt(state['fastlio_vx']**2 + state['fastlio_vy']**2 + state['fastlio_vz']**2)
+        slam_line2 = f"      Vel{format_position_compact(state['fastlio_vx'], state['fastlio_vy'], state['fastlio_vz'])} (mag:{slam_vel_mag:6.3f}m/s)  Ori: R{state['fastlio_roll']:+6.1f}° P{state['fastlio_pitch']:+6.1f}° Y{state['fastlio_yaw']:+6.1f}°"
+        safe_add(row, 2, slam_line2, slam_color)
+        row += 1
 
-        # SLAM Position
-        safe_add(15, 2,
-            f"POS   : X={state['fastlio_x']:+8.3f}  Y={state['fastlio_y']:+8.3f}  Z={state['fastlio_z']:+8.3f} m",
-            c_mag if state['fastlio_healthy'] else c_wht)
+        # ============ SENSOR HEALTH MATRIX ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ SENSOR HEALTH ]", c_info)
+        row += 1
+        
+        lidar_conf = get_sensor_confidence("LIDAR")
+        baro_conf = get_sensor_confidence("BARO")
+        optflow_conf = get_sensor_confidence("OPTFLOW")
+        
+        lidar_stat = f"LIDAR {get_sensor_health_char(state['rangefinder_healthy'])} {lidar_conf:3d}%"
+        baro_stat = f"BARO  {get_sensor_health_char(True)} {baro_conf:3d}%"
+        optflow_stat = f"OPTFLOW {get_sensor_health_char(state['flow_qual'] > 50)} {optflow_conf:3d}% Q:{state['flow_qual']:3d}/255"
+        slam_stat = f"SLAM {get_sensor_health_char(state['fastlio_healthy'])} {slam_conf:3d}%"
+        livox_stat = f"LIVOX {get_sensor_health_char(state['livox_obs'] > 0)} Obs:{state['livox_obs']:5.2f}m Sectors:{state['livox_sectors']:2d}"
+        
+        health_color_lidar = c_ok if lidar_conf > 70 else c_warn if lidar_conf > 0 else c_neu
+        health_color_baro = c_ok
+        health_color_opt = c_ok if optflow_conf > 70 else c_warn if optflow_conf > 0 else c_neu
+        health_color_slam = c_ok if slam_conf > 70 else c_warn if slam_conf > 0 else c_neu
+        health_color_livox = c_ok if state['livox_obs'] > 0 else c_neu
+        
+        safe_add(row, 2, lidar_stat, health_color_lidar)
+        safe_add(row, 22, baro_stat, health_color_baro)
+        safe_add(row, 38, optflow_stat, health_color_opt)
+        safe_add(row, 60, slam_stat, health_color_slam)
+        row += 1
+        
+        safe_add(row, 2, livox_stat, health_color_livox)
+        safe_add(row, 30, f"EKF: 0x{state['ekf_flags']:04X}  Vision: {format_position_compact(state['vision_x'], state['vision_y'], state['vision_z'])}", c_neu)
+        row += 1
 
-        # SLAM Velocity
-        safe_add(16, 2,
-            f"VEL   : Vx={state['fastlio_vx']:+6.3f}  Vy={state['fastlio_vy']:+6.3f}  Vz={state['fastlio_vz']:+6.3f} m/s",
-            c_mag if state['fastlio_healthy'] else c_wht)
+        # ============ VIBRATION & PERFORMANCE ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ SYSTEM PERFORMANCE ]", c_info)
+        row += 1
+        
+        vib_spark = create_sparkline([v for v in state['vib_max_history'][-10:]])
+        cpu_spark = create_sparkline([min(c, 100) for c in state['cpu_load_history'][-10:]])
+        
+        vib_color = c_crit if vib_max > MAX_VIBRATION else c_warn if vib_max > MAX_GROUND_VIBE else c_ok
+        vib_line = f"VIB: X{state['vibration_filtered'][0]:6.2f} Y{state['vibration_filtered'][1]:6.2f} Z{state['vibration_filtered'][2]:6.2f} m/s² | Max:{vib_max:6.2f} | Record:{state['max_vib_recorded']:6.2f} | Trend:[{vib_spark}]"
+        safe_add(row, 2, vib_line, vib_color)
+        row += 1
+        
+        cpu_color = c_warn if state['cpu_load'] > 80 else c_ok
+        cpu_line = f"CPU: {state['cpu_load']:5.1f}% | Trend:[{cpu_spark}]  |  Throttle: {state['rc_throttle']:4d}({(state['rc_throttle']-1000)/10:5.1f}%)  |  OptFlow Vel: {state['flow_magnitude']:6.3f}m/s"
+        safe_add(row, 2, cpu_line, cpu_color)
+        row += 1
 
-        # SLAM Orientation
-        safe_add(17, 2,
-            f"ORIENT: R={state['fastlio_roll']:+6.1f}  P={state['fastlio_pitch']:+6.1f}  Y={state['fastlio_yaw']:+6.1f} deg",
-            c_mag if state['fastlio_healthy'] else c_wht)
+        # ============ BATTERY & ENERGY ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ BATTERY & ENERGY ]", c_info)
+        row += 1
+        
+        volt_drain, pct_drain = get_battery_drain_rate()
+        batt_spark = create_sparkline(state['batt_pct_history'][-10:])
+        
+        batt_color = c_crit if state['batt_v'] < 11.0 else c_warn if state['batt_v'] < MIN_SAFE_VOLTAGE else c_ok
+        batt_line = f"V: {state['batt_v']:5.2f}V  I: {state['batt_curr']:+6.1f}A  Pct: {state['batt_pct']:3d}%  Drain: {abs(volt_drain):6.3f}V/s ({abs(pct_drain):6.2f}%/s)  Remain: {remaining_time:5.1f}min  Trend:[{batt_spark}]"
+        safe_add(row, 2, batt_line, batt_color)
+        row += 1
 
-        # Point cloud stats (right side of SLAM panel)
-        safe_add(14, rc, f"POINTS: {state['fastlio_points']:,} pts/scan", c_mag if state['fastlio_healthy'] else c_wht)
-        safe_add(15, rc, f"MAP    : lab_map.pcd", c_wht)
-        safe_add(16, rc, f"LIDAR  : Livox Mid-360 (20Hz)", c_mag if state['fastlio_healthy'] else c_wht)
+        # ============ OBSTACLE AVOIDANCE / SAFETY ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ OBSTACLE AVOIDANCE ]", c_info)
+        row += 1
+        
+        obs_color = c_crit if state['livox_obs'] < 0.5 else c_warn if state['livox_obs'] < 1.0 else c_ok
+        obs_line = f"Min Distance: {state['livox_obs']:6.2f}m  Sectors Active: {state['livox_sectors']:2d}  Safety: {'🔴 CRITICAL' if state['livox_obs'] < 0.3 else '🟠 WARNING' if state['livox_obs'] < 0.8 else '🟢 SAFE'}"
+        safe_add(row, 2, obs_line, obs_color)
+        row += 2
 
-        # --- COMMANDS ---
-        safe_add(19, 0, mid, c_cyn)
-        safe_add(20, 2, "[ MISSION ]  [c] Calibrate  [o] Set Origin  [k] Auto Takeoff  [j] Auto Land", c_ylw)
-        safe_add(21, 2, "             [h] AltHold    [l] Loiter      [a] Arm           [d] Disarm", c_ylw)
-        safe_add(22, 2, "[ MANUAL  ]  [W/S] Pitch    [A/D] Roll      [UP/DN] Throttle  [x] KILL  [q] Quit", c_ylw)
-        safe_add(23, 2, "[ DEBUG   ]  [r] ROS2 Status  [e] Event Log Export", c_ylw)
-        safe_add(24, 0, mid, c_cyn)
-        safe_add(24, 2, f"RC STICKS: THR:{int(state['rc_throttle']):4d}  PCH:{int(state['rc_pitch']):4d}  ROL:{int(state['rc_roll']):4d}  YAW:{int(state['rc_yaw']):4d}", c_cyn)
+        # ============ RC CONTROL ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[RC CONTROL & COMMANDS]", c_info)
+        row += 1
+        
+        thr_pct = (state['rc_throttle'] - 1000) / 10.0
+        thr_bar = "█" * int(thr_pct / 5) + "░" * (20 - int(thr_pct / 5))
+        rc_line = f"THR: [{thr_bar}] {min(100,thr_pct):5.1f}%  PITCH: {int(state['rc_pitch']):4d}  ROLL: {int(state['rc_roll']):4d}  YAW: {int(state['rc_yaw']):4d}"
+        safe_add(row, 2, rc_line, c_info)
+        row += 1
+        
+        safe_add(row, 2, "[MISSION] k=Takeoff  j=Land  [MODE] h=AltHold  l=Loiter  [CONTROL] a=Arm  d=Disarm  x=KILL  q=Quit", c_warn)
+        row += 1
+        
+        safe_add(row, 2, "[MANUAL] W/S=Pitch  A/D=Roll  ↑↓=Throttle  [DEBUG] r=ROS2  e=Export  c=CalGyr  o=Origin  SPACE=Hover", c_warn)
+        row += 2
 
-        # --- EVENT LOG ---
-        safe_add(25, 0, mid, c_cyn)
-        safe_add(25, 3, "[ EVENT LOG ]", c_ylw)
+        # ============ EVENT LOG ============
+        safe_add(row, 0, mid, c_info)
+        safe_add(row, 2, "[ EVENT LOG ]", c_info)
+        row += 1
+        
         for i, log_msg in enumerate(state['log']):
-            if 26 + i < rows - 1:
-                safe_add(26 + i, 2, f"> {log_msg}", c_grn)
+            log_row = row + i
+            if log_row < rows - 1:
+                # Truncate very long messages
+                display_msg = log_msg if len(log_msg) < W - 4 else log_msg[:W-7] + "..."
+                safe_add(log_row, 2, f"  {display_msg}", c_ok)
 
         stdscr.refresh()
+        
+        # Safety check for emergency RTL conditions
+        check_emergency_rtl(master)
+        
         key = stdscr.getch()
 
         # Reset sticks to neutral each cycle
@@ -973,13 +1572,16 @@ def draw_dashboard(stdscr, master):
                 threading.Thread(target=auto_takeoff_sequence, args=(master,), daemon=True).start()
             elif key == ord('j'):
                 threading.Thread(target=auto_land_sequence, args=(master,), daemon=True).start()
+            elif key == ord('n'):
+                # Navigate home (RTL)
+                trigger_rtl(master)
             elif key == ord('w'):
                 state['rc_pitch'] = 1420   # Pitch forward
             elif key == ord('s'):
                 state['rc_pitch'] = 1580   # Pitch backward
-            elif key == ord('a'): 
+            elif key in [ord('A'), ord('a')] and not curses.ascii.isalpha(key):  # Avoid conflict with arm
                 state['rc_roll'] = 1420
-            elif key == ord('d'): 
+            elif key in [ord('D'), ord('d')] and not curses.ascii.isalpha(key):  # Avoid conflict with disarm
                 state['rc_roll'] = 1580
             elif key == curses.KEY_UP:
                 state['rc_throttle'] = min(state['rc_throttle'] + 25, 2000)
@@ -997,7 +1599,7 @@ def draw_dashboard(stdscr, master):
                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
                 )
             elif key == ord('r'):
-                # ROS2 diagnostics
+                # ROS2 diagnostics & telemetry summary
                 if ROS2_AVAILABLE:
                     if state['ros2_active']:
                         fastlio_age = time.time() - state['fastlio_last_time'] if state['fastlio_last_time'] > 0 else 999
@@ -1007,17 +1609,38 @@ def draw_dashboard(stdscr, master):
                 else:
                     update_log("ROS2: Not installed. Run: pip install rclpy")
             elif key == ord('e'):
-                # Export diagnostics
-                from datetime import datetime
+                # Export comprehensive diagnostics
                 export_log = f"diag_{session_id}.txt"
                 with open(export_log, 'a') as f:
-                    f.write(f"\n=== DIAGNOSTIC SNAPSHOT {datetime.now().strftime('%H:%M:%S')} ===\n")
-                    f.write(f"ROS2 Active: {state['ros2_active']}\n")
-                    f.write(f"FAST-LIO Healthy: {state['fastlio_healthy']}\n")
-                    f.write(f"FAST-LIO Hz: {state['fastlio_hz']:.1f}\n")
-                    f.write(f"SLAM Position: ({state['fastlio_x']:.3f}, {state['fastlio_y']:.3f}, {state['fastlio_z']:.3f})\n")
-                    f.write(f"Livox Points: {state['fastlio_points']}\n")
-                    f.write(f"LIDAR Alt: {state['lidar_alt']:.2f} m\n")
+                    f.write(f"\n{'='*70}\n")
+                    f.write(f"DIAGNOSTIC SNAPSHOT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"{'='*70}\n")
+                    f.write(f"FLIGHT STATE:\n")
+                    f.write(f"  Mode: {state['mode']} | Armed: {state['armed']} | Macro: {state['macro_status']}\n")
+                    f.write(f"  Flight Time: {state['flight_time']:.1f}s | Max Alt: {state['max_alt_achieved']:.2f}m\n")
+                    f.write(f"\nBATTERY & POWER:\n")
+                    volt_dr, pct_dr = get_battery_drain_rate()
+                    f.write(f"  Voltage: {state['batt_v']:.2f}V | Current: {state['batt_curr']:.1f}A | Capacity: {state['batt_pct']}%\n")
+                    f.write(f"  Drain Rate: {abs(volt_dr):.3f}V/s ({abs(pct_dr):.1f}%/s)\n")
+                    f.write(f"\nESTIMATES & SENSORS:\n")
+                    f.write(f"  Barometer Alt: {state['alt']:.2f}m | Lidar Alt: {state['lidar_alt']:.2f}m | Error: {state['pos_error_lidar_vs_baro']:.3f}m\n")
+                    f.write(f"  Climb Rate: {state['climb']:.2f}m/s | Avg: {get_avg_climb_rate():.2f}m/s\n")
+                    f.write(f"  Attitude: R{state['roll']:.1f}° P{state['pitch']:.1f}° Y{state['hdg']:.0f}°\n")
+                    f.write(f"\nVIBRATION & PERFORMANCE:\n")
+                    f.write(f"  Raw: X{state['vibration'][0]:.3f} Y{state['vibration'][1]:.3f} Z{state['vibration'][2]:.3f} m/s²\n")
+                    f.write(f"  Filtered: X{state['vibration_filtered'][0]:.2f} Y{state['vibration_filtered'][1]:.2f} Z{state['vibration_filtered'][2]:.2f} m/s²\n")
+                    f.write(f"  Max Recorded: {state['max_vib_recorded']:.2f}m/s² | CPU Load: {state['cpu_load']:.1f}%\n")
+                    f.write(f"\nSENSORS:\n")
+                    f.write(f"  LIDAR: {'OK' if state['rangefinder_healthy'] else 'FAIL'} | Livox: {state['livox_obs']:.2f}m ({state['livox_sectors']} sectors)\n")
+                    f.write(f"  OptFlow Quality: {state['flow_qual']}/255 | Mag: {state['flow_magnitude']:.3f}m/s\n")
+                    f.write(f"  Vision: X{state['vision_x']:.2f} Y{state['vision_y']:.2f} Z{state['vision_z']:.2f}m\n")
+                    f.write(f"  EKF Flags: 0x{state['ekf_flags']:04X}\n")
+                    f.write(f"\nFAST-LIO SLAM:\n")
+                    f.write(f"  Status: {'HEALTHY' if state['fastlio_healthy'] else 'INACTIVE'} | Hz: {state['fastlio_hz']:.1f}\n")
+                    f.write(f"  Position: X{state['fastlio_x']:.3f} Y{state['fastlio_y']:.3f} Z{state['fastlio_z']:.3f}m\n")
+                    f.write(f"  Velocity: Vx{state['fastlio_vx']:.3f} Vy{state['fastlio_vy']:.3f} Vz{state['fastlio_vz']:.3f}m/s\n")
+                    f.write(f"  Orientation: R{state['fastlio_roll']:.1f}° P{state['fastlio_pitch']:.1f}° Y{state['fastlio_yaw']:.1f}°\n")
+                    f.write(f"  Point Cloud: {state['fastlio_points']:,} pts/scan\n")
                 update_log(f"Diagnostics exported to {export_log}")
 
         send_rc_override(master)
