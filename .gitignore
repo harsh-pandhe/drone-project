@@ -19,7 +19,6 @@ env/
 diag_*.txt
 telemetry_*.csv
 events_*.txt
-data/
 src/data/
 
 # Test outputs
@@ -50,3 +49,7 @@ htmlcov/
 # Misc
 *.tlog
 *.tlog.raw
+
+# Keep test datasets in git
+!data/
+!data/**

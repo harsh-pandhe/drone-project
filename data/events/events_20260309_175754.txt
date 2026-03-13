@@ -1,4 +1,3 @@
-=== ASCEND MISSION CONTROL ULTIMATE v6.1 SESSION: 20260309_175754 ===
-[17:58:32.570] Connected to Pixhawk!
-[17:58:32.570] SYS: Initialising ArduPilot
-[17:58:32.571] SYS: Calibrating barometer
+version https://git-lfs.github.com/spec/v1
+oid sha256:21c78f0871bd42c4a59e74855c04c50a416c14978e01ddbd6b9a3812b24eca3e
+size 192

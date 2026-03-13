@@ -1,1 +1,3 @@
-=== ASCEND FLIGHT LOG (RC OVERRIDE MODE): 20260308_151024 ===
+version https://git-lfs.github.com/spec/v1
+oid sha256:1f3ec3fd0f8bf592a5ee5c70b8a8df5af624d86a9a21741c9322cc3467891a0a
+size 62

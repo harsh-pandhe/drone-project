@@ -1,34 +1,3 @@
-=== ASCEND MISSION CONTROL ULTIMATE v5.7 SESSION: 20260308_194844 ===
-[19:48:45.385] MavLink Online.
-[19:48:45.838] SYS: Field Elevation Set: 0m
-[19:48:46.877] SYS: Field Elevation Set: 0m
-[19:48:47.768] SYS: Field Elevation Set: 0m
-[19:48:48.801] SYS: Field Elevation Set: 0m
-[19:48:49.407] SYS: Updating barometer calibration
-[19:48:49.418] SYS: Barometer calibration complete
-[19:48:49.726] SYS: Field Elevation Set: 0m
-[19:48:50.918] SYS: Field Elevation Set: 0m
-[19:48:51.807] SYS: Field Elevation Set: 0m
-[19:48:52.807] SYS: Field Elevation Set: 0m
-[19:48:53.845] SYS: Field Elevation Set: 0m
-[19:48:54.726] SYS: Field Elevation Set: 0m
-[19:48:54.899] CMD: Forcing Origin Reset...
-[19:48:55.779] SYS: Field Elevation Set: 0m
-[19:48:56.820] SYS: Field Elevation Set: 0m
-[19:48:57.862] SYS: Field Elevation Set: 0m
-[19:49:03.185] AUTO: Initializing Takeoff Sequence...
-[19:49:04.185] AUTO: Ground: 0.0m. Maal: 1.0m
-[19:49:18.110] SYS: Potential Thrust Loss (4)
-[19:49:21.246] AUTO: Hover Active at 1m.
-[19:49:26.959] AUTO: Precision Landing Started...
-[19:49:26.960] AUTO: Descending slowly...
-[19:49:33.674] AUTO: Ground Proximity. Final Touchdown...
-[19:49:35.174] AUTO: Touchdown Confirmed. Disarmed.
-[19:49:35.495] SYS: Field Elevation Set: 0m
-[19:49:36.389] SYS: Field Elevation Set: 0m
-[19:49:37.428] SYS: Field Elevation Set: 0m
-[19:49:38.319] SYS: Field Elevation Set: 0m
-[19:49:39.511] SYS: Field Elevation Set: 0m
-[19:49:40.400] SYS: Field Elevation Set: 0m
-[19:49:41.438] SYS: Field Elevation Set: 0m
-[19:49:42.477] SYS: Field Elevation Set: 0m
+version https://git-lfs.github.com/spec/v1
+oid sha256:d30e041eb8dd865e4da8c1f5ab038ac461cdccb51bbfb58e0b1664a4bf5b1b8f
+size 1560

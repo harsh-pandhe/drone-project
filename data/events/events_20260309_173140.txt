@@ -1,2 +1,3 @@
-=== ASCEND MISSION CONTROL ULTIMATE v6.1 SESSION: 20260309_173140 ===
-[17:31:41.349] Connected to Pixhawk!
+version https://git-lfs.github.com/spec/v1
+oid sha256:24e02d5e73c3b66a2e445064fa4997b44a7616a969f885118dcd331fcfe3d9aa
+size 107

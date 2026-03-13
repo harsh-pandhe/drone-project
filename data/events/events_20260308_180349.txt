@@ -1,2 +1,3 @@
-=== ASCEND FLIGHT LOG (RC OVERRIDE MODE): 20260308_180349 ===
-[18:04:04.146] CMD: Zeroing Barometer...
+version https://git-lfs.github.com/spec/v1
+oid sha256:314466241ed6e39730ea201fb30039ee6bad63e12aa4b71d8613937d65749160
+size 103
