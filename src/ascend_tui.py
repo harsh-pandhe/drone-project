@@ -3,25 +3,33 @@ import threading
 import curses
 import csv
 import math
+import struct
 from datetime import datetime
 from pymavlink import mavutil
 
 # --- CONDITIONAL ROS2 IMPORT ---
 ROS2_AVAILABLE = False
+LIVOX_CUSTOM_AVAILABLE = False
+ROS2_IMPORT_ERROR = ""
 try:
     import rclpy
     from rclpy.node import Node
     from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import PointCloud2
+    from sensor_msgs.msg import PointCloud2, Imu
+    try:
+        from livox_ros_driver2.msg import CustomMsg
+        LIVOX_CUSTOM_AVAILABLE = True
+    except ImportError:
+        CustomMsg = None
     ROS2_AVAILABLE = True
-except ImportError:
-    pass
+except ImportError as e:
+    ROS2_IMPORT_ERROR = str(e)
 
 # --- MISSION PARAMETERS ---
 TARGET_ALTITUDE = 1.0     # Target hover height in meters
 SPOOL_THR = 1400          # Idle throttle to test frame vibrations
 LIFTOFF_THR = 1600        # Smooth liftoff power (+150 PWM above hover for positive authority)
-HOVER_THR = 1450          # Neutral throttle for hover (calibrate for your frame!)
+HOVER_THR = 1500          # Neutral throttle for ALT_HOLD (1500 = FC holds altitude)
 MIN_SAFE_VOLTAGE = 10.5   # Battery safety cutoff (volts)
 MAX_VIBRATION = 25.0      # Abort flight if vibrations exceed 25 m/s^2
 MAX_GROUND_VIBE = 18.0    # Strict threshold during ground spool-up
@@ -50,10 +58,30 @@ CLIMB_RAMP_RATE = 5       # PWM per cycle (increased from 2 for faster climb ram
 YAW_RATE_LIMIT = 60.0     # Max rate of change for yaw angle (degrees/second)
 YAW_INTEGRAL_LIMIT = 30   # Max accumulated yaw error
 
+# --- FAST-LIO & SLAM ---
+FASTLIO_TIMEOUT = 3.0     # Seconds before FAST-LIO is considered unhealthy
+SLAM_WARN_INTERVAL = 5.0  # Minimum seconds between SLAM warning messages
+
+# --- LOG-DRIVEN SAFETY FILTERS ---
+MIN_PREFLIGHT_FLOW_QUAL = 80   # Require stable flow before autonomous takeoff
+FLOW_SPIKE_REJECT_MPS = 1.2    # Reject unrealistic optical-flow velocity spikes
+FLOW_LPF_ALPHA = 0.35          # Optical-flow low-pass filter coefficient
+LIDAR_LPF_ALPHA = 0.35         # Rangefinder low-pass filter coefficient
+MAX_LIDAR_STEP_M = 0.35        # Reject sudden lidar jumps larger than this
+MIN_TAKEOFF_CLIMB_RATE = 0.12  # m/s minimum expected climb during ascent
+NO_CLIMB_ABORT_SEC = 2.5       # Abort if no climb response for this long
+
+# --- SENSOR USAGE POLICY ---
+# Flight control must remain Rangefinder + Optical Flow only.
+# Livox/FAST-LIO is recorded for ML and monitoring, not used for control decisions.
+USE_FASTLIO_FOR_CONTROL = False
+
 # --- LOGGING INITIALIZATION ---
 session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 csv_filename = f"telemetry_{session_id}.csv"
 txt_filename = f"events_{session_id}.txt"
+livox_pointcloud_filename = f"livox_pointcloud_{session_id}.bin"
+livox_imu_filename = f"livox_imu_{session_id}.csv"
 
 telemetry_file = open(csv_filename, "w", newline="")
 csv_writer = csv.writer(telemetry_file)
@@ -72,15 +100,32 @@ csv_writer.writerow([
 event_file = open(txt_filename, "w")
 event_file.write(f"=== ASCEND MISSION CONTROL v8.0 SESSION: {session_id} ===\n")
 
+# Livox point cloud binary file - stores raw XYZ points with timestamps
+livox_pc_file = open(livox_pointcloud_filename, "wb")
+# Write header: magic bytes + version
+livox_pc_file.write(b'LIVOXPC1')  # 8-byte magic header
+livox_pc_file.flush()
+
+# Livox IMU CSV file - stores accelerometer and gyroscope data
+livox_imu_file = open(livox_imu_filename, "w", newline="")
+livox_imu_writer = csv.writer(livox_imu_file)
+livox_imu_writer.writerow([
+    "Timestamp", "Accel_X", "Accel_Y", "Accel_Z",
+    "Gyro_X", "Gyro_Y", "Gyro_Z",
+    "Orient_X", "Orient_Y", "Orient_Z", "Orient_W"
+])
+
 # --- GLOBAL STATE ---
 state = {
     'alt': 0.0, 'lidar_alt': 0.0, 'rangefinder_healthy': False, 'climb': 0.0,
+    'lidar_alt_raw': 0.0, 'lidar_last_update': 0.0,
     'hdg': 0, 'roll': 0.0, 'pitch': 0.0,
     'batt_v': 0.0, 'batt_pct': 0, 'batt_curr': 0.0,
     'mode': 'CONNECTING...', 'armed': False, 'macro_status': 'IDLE',
     'log': [],
     'rc_throttle': 1000, 'rc_pitch': 1500, 'rc_roll': 1500, 'rc_yaw': 1500,
     'ekf_flags': 0, 'flow_qual': 0, 'flow_vx': 0.0, 'flow_vy': 0.0,
+    'flow_vx_raw': 0.0, 'flow_vy_raw': 0.0, 'flow_last_update': 0.0,
     'vibration': [0.0, 0.0, 0.0], 'vibration_filtered': [0.0, 0.0, 0.0],
     'vibration_history': [[], [], []], 'cpu_load': 0,
     'livox_obs': 0.0, 'livox_sectors': 0, 'vision_x': 0.0, 'vision_y': 0.0, 'vision_z': 0.0,
@@ -91,6 +136,9 @@ state = {
     'fastlio_points': 0, 'fastlio_healthy': False, 'fastlio_hz': 0.0,
     'fastlio_last_time': 0.0, 'fastlio_msg_count': 0, 'fastlio_hz_timer': 0.0,
     'ros2_active': False, 'ros2_init_time': 0.0, 'ros2_error': '',
+    # Livox Mid-360 ML Training Data Collection
+    'livox_pc_frames': 0, 'livox_pc_last_pts': 0,  # Point cloud frame count and last point count
+    'livox_imu_samples': 0,  # IMU sample count
     # Telemetry metrics for trending
     'batt_v_history': [], 'batt_pct_history': [], 'climb_history': [],
     'vib_max_history': [], 'alt_history': [],
@@ -108,7 +156,13 @@ state = {
     'desired_pos_x': 0.0, 'desired_pos_y': 0.0,  # Target position for hold
     'rtl_active': False,  # Return-to-launch active
     'sensor_status_log': [],  # Track sensor health during flight
+    'slam_last_warn_time': 0.0,  # Rate-limit SLAM warnings
 }
+
+
+def low_pass(prev_value, new_value, alpha):
+    """Simple first-order low-pass filter."""
+    return (alpha * new_value) + ((1.0 - alpha) * prev_value)
 
 def update_log(msg):
     """Updates the UI event log and the black-box event file simultaneously."""
@@ -137,6 +191,22 @@ def send_rc_override(master):
     )
 
 
+def emergency_disarm(master):
+    """Emergency disarm - cut throttle and disarm immediately."""
+    state['rc_throttle'] = 1000
+    state['rc_roll'] = 1500
+    state['rc_pitch'] = 1500
+    state['rc_yaw'] = 1500
+    send_rc_override(master)
+    time.sleep(0.1)
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
+    )
+    state['macro_status'] = 'IDLE'
+    state['home_set'] = False
+
+
 # --- IMPROVED POSITION HOLD & DRIFT CORRECTION ---
 
 def set_home_position():
@@ -146,8 +216,9 @@ def set_home_position():
     else:
         state['home_z'] = state['alt']
     
-    # Use SLAM position if available, otherwise start from origin
-    if state['fastlio_healthy']:
+    # Flight control policy: do not use FAST-LIO for control/home reference.
+    # Home XY is maintained in the local optical-flow frame only.
+    if USE_FASTLIO_FOR_CONTROL and state['fastlio_healthy']:
         state['home_x'] = state['fastlio_x']
         state['home_y'] = state['fastlio_y']
     else:
@@ -219,6 +290,10 @@ def get_drift_magnitude():
 
 def get_best_altitude_for_control():
     """Get most reliable altitude estimate for closed-loop control."""
+    # Staleness guard for rangefinder stream.
+    if state['lidar_last_update'] > 0 and (time.time() - state['lidar_last_update']) > 0.6:
+        state['rangefinder_healthy'] = False
+
     # Prefer LIDAR (rangefinder) for better hover control
     if state['rangefinder_healthy'] and state['lidar_alt'] > 0:
         return state['lidar_alt']
@@ -240,37 +315,55 @@ def trigger_rtl(master):
 
 
 def check_emergency_rtl(master):
-    """Monitor for emergency conditions that should trigger RTL."""
+    """Monitor for emergency conditions that should trigger RTL.
+    
+    CRITICAL: NEVER trigger RTL if KILL switch was pressed (macro_status == IDLE
+    and we were just in a flight macro). RTL re-engages motors which is deadly
+    if the drone is already crashed/flipped.
+    """
     if not state['armed'] or state['rtl_active']:
         return  # Not armed or already in RTL
     
+    # NEVER override a KILL switch — if macro_status is IDLE and drone is
+    # tilted, it means the user killed it. DO NOT re-engage motors.
+    # Only monitor during active autonomous flight.
+    if state['macro_status'] == 'IDLE':
+        return
+    
     # Low battery emergency
     if state['batt_pct'] < 10 and state['batt_v'] < 10.5:
-        update_log("❌ CRITICAL: Battery < 10%! Triggering RTL!")
-        trigger_rtl(master)
+        update_log("CRITICAL: Battery < 10%! Emergency disarm!")
+        emergency_disarm(master)
         return
     
-    # Excessive vibration
+    # Excessive vibration — disarm, don't RTL (RTL can make things worse)
     if max(state['vibration_filtered']) > MAX_VIBRATION * 1.5:
-        update_log("❌ CRITICAL: Extreme vibrations! Triggering RTL!")
-        trigger_rtl(master)
+        update_log("CRITICAL: Extreme vibrations! Emergency disarm!")
+        emergency_disarm(master)
         return
     
-    # Excessive tilt (loss of control)
-    if abs(state['roll']) > 60 or abs(state['pitch']) > 60:
-        update_log("❌ CRITICAL: Excessive tilt! Triggering RTL!")
-        trigger_rtl(master)
+    # Excessive tilt (loss of control) — disarm immediately, NOT RTL
+    # RTL tried to fly the drone while it was flipped → caused the crash
+    if abs(state['roll']) > 45 or abs(state['pitch']) > 45:
+        update_log(f"CRITICAL: Tilt {state['roll']:.0f}/{state['pitch']:.0f}! Emergency disarm!")
+        emergency_disarm(master)
         return
     
-    # SLAM failure during flight (if was healthy)
-    if state['home_set'] and state['fastlio_healthy'] is False and time.time() - state['fastlio_last_time'] > 5.0:
-        if state['lidar_alt'] < 5.0:  # Only alert if low altitude
-            update_log("⚠ WARNING: SLAM lost at low altitude")
+    # SLAM failure during flight - only warn if SLAM was previously active
+    if state['home_set'] and state['fastlio_last_time'] > 0 and state['fastlio_healthy'] is False:
+        if time.time() - state['fastlio_last_time'] > 5.0 and state['lidar_alt'] < 5.0:
+            now = time.time()
+            if now - state['slam_last_warn_time'] > SLAM_WARN_INTERVAL:
+                update_log("⚠ WARNING: SLAM lost at low altitude")
+                state['slam_last_warn_time'] = now
     
-    # Loss of rangefinder at low altitude
+    # Loss of rangefinder at low altitude - RATE LIMITED
     if not state['rangefinder_healthy'] and state['lidar_alt'] < 1.0:
         if state['alt'] < 0.5:
-            update_log("⚠ WARNING: Rangefinder lost near ground")
+            now = time.time()
+            if now - state.get('rangefinder_last_warn_time', 0) > SLAM_WARN_INTERVAL:
+                update_log("⚠ WARNING: Rangefinder lost near ground")
+                state['rangefinder_last_warn_time'] = now
 
 
 # --- ROS2 FAST-LIO SUBSCRIBER ---
@@ -315,6 +408,35 @@ if ROS2_AVAILABLE:
             except Exception as e:
                 self.get_logger().warn(f"Failed to subscribe to /cloud_registered: {e}")
                 self.cloud_sub = None
+            
+            try:
+                # Subscribe to raw Livox point cloud for ML training.
+                # msg_MID360_launch publishes livox_ros_driver2/CustomMsg on /livox/lidar.
+                if LIVOX_CUSTOM_AVAILABLE:
+                    self.livox_cloud_sub = self.create_subscription(
+                        CustomMsg, '/livox/lidar', self.livox_custom_cloud_callback, 5)
+                    self.get_logger().info("Subscribed to /livox/lidar (CustomMsg raw points)")
+                else:
+                    # Fallback for pointcloud2 launch variants.
+                    self.livox_cloud_sub = self.create_subscription(
+                        PointCloud2, '/livox/lidar', self.livox_cloud_callback, 5)
+                    self.get_logger().info("Subscribed to /livox/lidar (PointCloud2 raw points)")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to subscribe to /livox/lidar: {e}")
+                self.livox_cloud_sub = None
+            
+            try:
+                # Subscribe to Livox IMU data
+                self.livox_imu_sub = self.create_subscription(
+                    Imu, '/livox/imu', self.livox_imu_callback, 50)
+                self.get_logger().info("Subscribed to /livox/imu topic")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to subscribe to /livox/imu: {e}")
+                self.livox_imu_sub = None
+            
+            # Point cloud frame counter for logging
+            self.pc_frame_count = 0
+            self.imu_frame_count = 0
                 
             self.get_logger().info("FAST-LIO subscriber initialized (Mid-360)")
             state['ros2_init_time'] = time.time()
@@ -362,6 +484,110 @@ if ROS2_AVAILABLE:
                     state['fastlio_points'] = (msg.row_step * msg.height) // msg.point_step
             except Exception as e:
                 self.get_logger().error(f"Cloud callback error: {e}")
+
+        def livox_cloud_callback(self, msg):
+            """Store full raw Livox point cloud to binary file for ML training."""
+            try:
+                timestamp = time.time()
+                num_points = (msg.row_step * msg.height) // msg.point_step if msg.point_step > 0 else 0
+                
+                if num_points > 0:
+                    # Write frame to binary file:
+                    # Header: timestamp + point_count + point_step
+                    # Data: raw PointCloud2 payload
+                    livox_pc_file.write(struct.pack('<d', timestamp))  # timestamp
+                    livox_pc_file.write(struct.pack('<I', num_points))  # num points
+                    livox_pc_file.write(struct.pack('<H', msg.point_step))  # bytes per point
+                    livox_pc_file.write(msg.data)  # raw point cloud data
+                    
+                    self.pc_frame_count += 1
+                    
+                    # Flush every 10 frames to prevent data loss
+                    if self.pc_frame_count % 10 == 0:
+                        livox_pc_file.flush()
+                    
+                    # Update state for display
+                    state['livox_pc_frames'] = self.pc_frame_count
+                    state['livox_pc_last_pts'] = num_points
+                    
+            except Exception as e:
+                self.get_logger().error(f"Livox cloud callback error: {e}")
+
+        def livox_custom_cloud_callback(self, msg):
+            """Store full livox_ros_driver2/CustomMsg cloud data for Mid-360 ML training."""
+            try:
+                timestamp = time.time()
+                num_points = int(msg.point_num)
+
+                if num_points > 0:
+                    # Binary frame:
+                    # [float64 ts][uint32 point_num][uint16 point_step=19][uint64 timebase]
+                    # then repeated points as <IfffBBB>
+                    #   offset_time(uint32), x(float32), y(float32), z(float32),
+                    #   reflectivity(uint8), tag(uint8), line(uint8)
+                    livox_pc_file.write(struct.pack('<d', timestamp))
+                    livox_pc_file.write(struct.pack('<I', num_points))
+                    livox_pc_file.write(struct.pack('<H', 19))
+                    livox_pc_file.write(struct.pack('<Q', int(msg.timebase)))
+
+                    for p in msg.points:
+                        livox_pc_file.write(struct.pack(
+                            '<IfffBBB',
+                            int(p.offset_time),
+                            float(p.x),
+                            float(p.y),
+                            float(p.z),
+                            int(p.reflectivity),
+                            int(p.tag),
+                            int(p.line)
+                        ))
+
+                    self.pc_frame_count += 1
+                    if self.pc_frame_count % 10 == 0:
+                        livox_pc_file.flush()
+
+                    state['livox_pc_frames'] = self.pc_frame_count
+                    state['livox_pc_last_pts'] = num_points
+
+            except Exception as e:
+                self.get_logger().error(f"Livox CustomMsg callback error: {e}")
+
+        def livox_imu_callback(self, msg):
+            """Store Livox IMU data to CSV for ML training."""
+            try:
+                timestamp = time.time()
+                
+                # Extract IMU data
+                accel_x = msg.linear_acceleration.x
+                accel_y = msg.linear_acceleration.y
+                accel_z = msg.linear_acceleration.z
+                gyro_x = msg.angular_velocity.x
+                gyro_y = msg.angular_velocity.y
+                gyro_z = msg.angular_velocity.z
+                orient_x = msg.orientation.x
+                orient_y = msg.orientation.y
+                orient_z = msg.orientation.z
+                orient_w = msg.orientation.w
+                
+                # Write to CSV
+                livox_imu_writer.writerow([
+                    f"{timestamp:.6f}",
+                    f"{accel_x:.6f}", f"{accel_y:.6f}", f"{accel_z:.6f}",
+                    f"{gyro_x:.6f}", f"{gyro_y:.6f}", f"{gyro_z:.6f}",
+                    f"{orient_x:.6f}", f"{orient_y:.6f}", f"{orient_z:.6f}", f"{orient_w:.6f}"
+                ])
+                
+                self.imu_frame_count += 1
+                
+                # Flush every 100 samples
+                if self.imu_frame_count % 100 == 0:
+                    livox_imu_file.flush()
+                
+                # Update state for display
+                state['livox_imu_samples'] = self.imu_frame_count
+                
+            except Exception as e:
+                self.get_logger().error(f"Livox IMU callback error: {e}")
 
 
 def run_ros2_thread():
@@ -509,7 +735,7 @@ def get_altitude_slope():
     if len(state['alt_history']) < 10:
         return 0.0
     recent = state['alt_history'][-10:]
-    oldest = state['alt_history'][0]
+    oldest = recent[0]
     return (recent[-1] - oldest) / 0.5  # Rate in m/sec
 
 
@@ -610,7 +836,7 @@ def get_sensor_confidence(sensor_name):
 def get_best_altitude_estimate():
     """Return best altitude estimate and confidence."""
     lidar_conf = get_sensor_confidence("LIDAR")
-    slam_conf = get_sensor_confidence("SLAM")
+    slam_conf = get_sensor_confidence("SLAM") if USE_FASTLIO_FOR_CONTROL else 0
     baro_conf = get_sensor_confidence("BARO")
     
     if lidar_conf > slam_conf and lidar_conf > 50:
@@ -670,29 +896,52 @@ def run_preflight_diagnostics():
     if max(state['vibration']) > 5.0:
         update_log(f"DIAG: WARN - Ground vibrations elevated ({max(state['vibration']):.2f} m/s²). Check gimbal/prop balance.")
         
-    if state['flow_qual'] < 10:
-        update_log(f"DIAG: WARN - Optical Flow blind (Qual: {state['flow_qual']}). Needs light/texture.")
-        
+    if state['flow_qual'] < MIN_PREFLIGHT_FLOW_QUAL:
+        update_log(
+            f"DIAG: FAIL - Optical Flow quality too low ({state['flow_qual']}). "
+            f"Need >= {MIN_PREFLIGHT_FLOW_QUAL}."
+        )
+        return False
+
     if not state['rangefinder_healthy']:
-        update_log("DIAG: WARN - Lidar dead. Relying on Barometer (Risk of drift).")
+        update_log("DIAG: FAIL - Rangefinder unavailable. Autonomous takeoff blocked.")
+        return False
 
     # FAST-LIO health check
     if state['ros2_active']:
         check_fastlio_health()
         if state['fastlio_healthy']:
-            update_log(f"DIAG: FAST-LIO OK ({state['fastlio_hz']:.0f} Hz)")
+            update_log(f"DIAG: FAST-LIO OK ({state['fastlio_hz']:.0f} Hz) [logging-only]")
         else:
-            update_log("DIAG: WARN - FAST-LIO not publishing. SLAM unavailable.")
+            update_log("DIAG: WARN - FAST-LIO not publishing. ML logging unavailable.")
     else:
-        update_log("DIAG: INFO - ROS2 not active. FAST-LIO unavailable.")
+        update_log("DIAG: INFO - ROS2 not active. Livox ML logging unavailable.")
+
+    update_log("DIAG: Control source = Rangefinder + Optical Flow (FAST-LIO disabled for control)")
         
     update_log("DIAG: PASS - Systems nominal. Ready for flight.")
     return True
 
 # --- FLIGHT AUTOMATION ---
 
-def auto_takeoff_sequence(master):
-    """Smooth automatic takeoff sequence with diagnostics and enhanced vibe-checks."""
+def auto_takeoff_sequence(master, target_alt=None):
+    """Automatic takeoff to specified altitude with stable position hold.
+    
+    Args:
+        target_alt: Altitude in meters (default: TARGET_ALTITUDE=1.0m)
+    
+    KEY DESIGN: Trust ArduCopter's ALT_HOLD controller for altitude.
+    - Throttle 1500 = hold altitude (FC PID handles internally)
+    - Throttle > 1500 = climb (rate proportional to stick deflection)
+    - Throttle < 1500 = descend
+    - Pitch/Roll 1500 = level/hold attitude (FC stabilization)
+    
+    DO NOT layer Python PID on top of ArduCopter's PID - this causes
+    oscillations and fighting between two controllers.
+    """
+    if target_alt is None:
+        target_alt = TARGET_ALTITUDE
+    
     if state['macro_status'] != 'IDLE': return
     state['macro_status'] = 'TAKEOFF'
     
@@ -700,489 +949,504 @@ def auto_takeoff_sequence(master):
         state['macro_status'] = 'IDLE'
         return
 
-    # 1. Disable all arming checks and force EKF origin
-    update_log("AUTO: Anchoring EKF Origin and waiting for convergence...")
-    master.mav.param_set_send(master.target_system, master.target_component, b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
-    time.sleep(1.5)  # Wait for ARMING_CHECK parameter to take effect on Pixhawk
+    # 1. Disable arming checks and force EKF origin
+    # Send RC keepalives throughout to prevent "Radio Failsafe" on FC
+    update_log("AUTO: Anchoring EKF Origin...")
+    state['rc_throttle'] = 1000
+    state['rc_pitch'] = 1500
+    state['rc_roll'] = 1500
+    state['rc_yaw'] = 1500
+    master.mav.param_set_send(master.target_system, master.target_component,
+                              b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    for _ in range(15):  # 1.5s with RC keepalive every 0.1s
+        send_rc_override(master)
+        time.sleep(0.1)
     
-    # Set GPS home location repeatedly to ensure it sticks
     for _ in range(5):
         master.mav.set_gps_global_origin_send(master.target_system, int(19.033 * 1e7), int(73.029 * 1e7), 0)
-        master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_DO_SET_HOME, 0, 1, 0, 0, 0, 0, 0, 0)
+        master.mav.command_long_send(master.target_system, master.target_component,
+                                     mavutil.mavlink.MAV_CMD_DO_SET_HOME, 0, 1, 0, 0, 0, 0, 0, 0)
+        send_rc_override(master)
         time.sleep(0.3)
-    
-    time.sleep(1.0)  # Extra settling time for EKF
+    for _ in range(10):  # 1.0s with RC keepalive
+        send_rc_override(master)
+        time.sleep(0.1)
 
-    # 2. Enter STABILIZE mode (most permissive for arming)
+    # 2. Enter STABILIZE for arming (most permissive)
     update_log("AUTO: Entering STABILIZE mode for arming...")
     master.set_mode(master.mode_mapping()['STABILIZE'])
-    time.sleep(1.0)  # Wait for mode change to confirm
+    for _ in range(10):  # 1.0s with RC keepalive (prevents Radio Failsafe)
+        send_rc_override(master)
+        time.sleep(0.1)
 
-    # 3. Capture ground altitude
-    start_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
-    target_abs_alt = start_alt + TARGET_ALTITUDE
-    update_log(f"AUTO: Ground: {start_alt:.2f}m. Target: {target_abs_alt:.2f}m")
+    # 3. Capture ground altitude reference
+    ground_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    abs_target = ground_alt + target_alt
+    update_log(f"AUTO: Ground: {ground_alt:.2f}m. Target: {abs_target:.2f}m ({target_alt:.0f}m AGL)")
 
-    # 4. Attempt to arm with extended retry logic
+    # 4. Arm with retry (RC keepalive during waits)
+    # ALWAYS send arm command even if state['armed'] appears True —
+    # FC may have auto-disarmed (DISARM_DELAY=10s) and HEARTBEAT is stale.
     update_log("AUTO: Attempting arm...")
-    arm_attempts = 0
-    while not state['armed'] and arm_attempts < 3:
-        master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 21196, 0, 0, 0, 0, 0)
-        time.sleep(1.5)
-        arm_attempts += 1
-        if not state['armed'] and arm_attempts < 3:
-            update_log(f"AUTO: Arm attempt {arm_attempts} failed, retrying...")
+    for arm_attempt in range(3):
+        master.mav.command_long_send(master.target_system, master.target_component,
+                                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                     0, 1, 21196, 0, 0, 0, 0, 0)
+        for _ in range(15):  # 1.5s with RC keepalive
+            send_rc_override(master)
+            time.sleep(0.1)
+        if state['armed']:
+            break
+        update_log(f"AUTO: Arm attempt {arm_attempt+1}/3 failed, retrying...")
     
     if not state['armed']:
-        update_log("AUTO: Arming FAILED completely. Safety switch engaged or other issue.")
+        update_log("AUTO: Arming FAILED. Safety switch or other issue.")
         state['macro_status'] = 'IDLE'
         return
     
-    update_log("AUTO: Armed successfully in STABILIZE. Switching to ALT_HOLD...")
+    update_log("AUTO: Armed. Switching to ALT_HOLD...")
 
-    # 5. Switch to ALT_HOLD for altitude control
+    # 5. Switch to ALT_HOLD
     master.set_mode(master.mode_mapping()['ALT_HOLD'])
-    time.sleep(1.0)
+    for _ in range(10):  # 1.0s with RC keepalive
+        send_rc_override(master)
+        time.sleep(0.1)
 
-    # 6. Extended Ground Spool-Up & Dynamic Vibration Check
-    update_log(f"AUTO: Extended spool-up to {SPOOL_THR} for thorough vibration testing...")
-    
-    # Ramp up to spool throttle slowly
-    for thr in range(1100, SPOOL_THR, 15):  # Reduced step size for smoother ramp
+    # 6. Ground spool-up with vibration test
+    update_log(f"AUTO: Spooling to {SPOOL_THR} for vibration test...")
+    for thr in range(1100, SPOOL_THR, 15):
         state['rc_throttle'] = thr
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
         send_rc_override(master)
         time.sleep(0.05)
     
-    # Hold at spool throttle for extended period (3.0 seconds instead of 1.5)
-    update_log("AUTO: Holding motors at spool throttle for 3.0s - monitoring vibrations...")
+    update_log("AUTO: Holding spool for 3.0s vibration check...")
     max_spool_vib = 0.0
-    for i in range(30):  # 30 * 0.1s = 3.0 seconds
+    for i in range(30):
         time.sleep(0.1)
         send_rc_override(master)
         current_max_vib = max(state['vibration_filtered'])
-        if current_max_vib > max_spool_vib:
-            max_spool_vib = current_max_vib
+        max_spool_vib = max(max_spool_vib, current_max_vib)
         if i % 10 == 0:
-            update_log(f"AUTO: Spool check [{i/30*100:.0f}%] - Peak vib: {max_spool_vib:.2f} m/s²")
-        
+            update_log(f"AUTO: Spool [{i*100//30}%] vib: {max_spool_vib:.2f} m/s²")
         if current_max_vib > MAX_GROUND_VIBE:
-            update_log(f"AUTO: ABORT! High ground vibrations ({current_max_vib:.1f} m/s² > {MAX_GROUND_VIBE} threshold). Balance Props!")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
+            update_log(f"AUTO: ABORT! Ground vib {current_max_vib:.1f} > {MAX_GROUND_VIBE}")
+            emergency_disarm(master)
             return
 
-    update_log(f"AUTO: Ground vibration test PASS (max {max_spool_vib:.2f} m/s²). Frame stable. Beginning climb...")
-
-    # 7. Controlled Climb (Slower and Smoother)
-    update_log(f"AUTO: Climbing to {TARGET_ALTITUDE}m with smooth throttle profile...")
-    climb_start_time = time.time()
-    climb_throttle = SPOOL_THR
-    last_climb_thr_update = time.time()
+    # Check that motors are actually spinning (vibration too low = FC disarmed silently)
+    if max_spool_vib < 0.5:
+        update_log(f"AUTO: ABORT! Vib only {max_spool_vib:.2f} — motors not spinning. FC may have disarmed.")
+        emergency_disarm(master)
+        return
     
-    while climb_throttle < LIFTOFF_THR:
-        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
-        alt_to_target = target_abs_alt - current_alt
-        current_time = time.time()
-        
-        # Smooth throttle ramp with time-based increment
-        if current_time - last_climb_thr_update >= 0.04:  # Update every ~2 control cycles
-            # FIX: Only dampen in final approach phase (last 30cm)
-            if alt_to_target < CLIMB_DIST_THRESHOLD:
-                # Damped approach: reduce throttle smoothly as we reach target
-                damp_ratio = alt_to_target / CLIMB_DIST_THRESHOLD  # 0 to 1
-                dampened_thr = HOVER_THR + int((LIFTOFF_THR - HOVER_THR) * damp_ratio * CLIMB_DAMPING)
-                climb_throttle = max(1500, dampened_thr)  # Never drop below minimum climb authority
-            elif climb_throttle < LIFTOFF_THR:
-                climb_throttle = min(LIFTOFF_THR, climb_throttle + CLIMB_RAMP_RATE)
-            last_climb_thr_update = current_time
-        
-        state['rc_throttle'] = int(climb_throttle)
+    # Re-verify armed state before committing to climb
+    if not state['armed']:
+        update_log("AUTO: ABORT! FC disarmed during spool-up.")
+        state['macro_status'] = 'IDLE'
+        return
+    
+    update_log(f"AUTO: Vib PASS (max {max_spool_vib:.2f}). Climbing to {target_alt:.0f}m...")
+
+    # 7. CLIMB PHASE
+    # In ALT_HOLD: throttle > 1500 = climb at rate proportional to deflection
+    # 1700 = strong climb (~40% of max range), 1580 = gentle approach
+    CLIMB_THR = 1700       # Strong climb command
+    APPROACH_THR = 1580    # Gentler climb for final 30cm
+    FINE_THR = 1530        # Very gentle for last 10cm
+    CLIMB_TIMEOUT = 15.0 + target_alt * 5.0  # More time for higher altitudes
+    
+    climb_start = time.time()
+    
+    # Ramp from spool throttle to full climb throttle
+    for thr in range(SPOOL_THR, CLIMB_THR, 10):
+        state['rc_throttle'] = thr
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
         send_rc_override(master)
         time.sleep(0.02)
+    
+    update_log("AUTO: Full climb power. Monitoring altitude...")
+    last_alt_log = time.time()
+    no_climb_since = None
+    
+    while time.time() - climb_start < CLIMB_TIMEOUT and state['armed']:
+        current_alt = get_best_altitude_for_control()
+        alt_remaining = abs_target - current_alt
         
-        # Safety: don't climb forever
-        if time.time() - climb_start_time > 8.0:
+        # Staged throttle: reduce as we approach target and damp with climb-rate feedback.
+        if alt_remaining < 0.10:
+            state['rc_throttle'] = 1520
+        elif alt_remaining < 0.30:
+            state['rc_throttle'] = 1560 if state['climb'] < 0.25 else 1535
+        else:
+            state['rc_throttle'] = 1680 if state['climb'] < 0.15 else 1620
+        
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
+        send_rc_override(master)
+        
+        # Check if target reached (within 5cm)
+        if current_alt >= abs_target - 0.05:
+            update_log(f"AUTO: Target reached at {current_alt:.2f}m")
             break
+
+        # Abort if FC is not responding to climb command despite enough margin.
+        if alt_remaining > 0.25 and state['climb'] < MIN_TAKEOFF_CLIMB_RATE:
+            if no_climb_since is None:
+                no_climb_since = time.time()
+            elif time.time() - no_climb_since > NO_CLIMB_ABORT_SEC:
+                update_log(
+                    f"AUTO: ABORT! No climb response for {NO_CLIMB_ABORT_SEC:.1f}s "
+                    f"(climb={state['climb']:.2f}m/s)."
+                )
+                emergency_disarm(master)
+                return
+        else:
+            no_climb_since = None
         
-        # Check for vibration issues during climb
+        # Periodic altitude log
+        if time.time() - last_alt_log > 1.0:
+            update_log(
+                f"AUTO: Climbing... {current_alt:.2f}m / {abs_target:.2f}m "
+                f"(remaining: {alt_remaining:.2f}m, climb: {state['climb']:.2f}m/s)"
+            )
+            last_alt_log = time.time()
+        
+        time.sleep(0.05)
+        
+        # Safety: tilt check
+        if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
+            update_log("AUTO: CRITICAL TILT during climb! KILL.")
+            emergency_disarm(master)
+            return
+        # Safety: vibration check
         if max(state['vibration_filtered']) > MAX_VIBRATION:
-            update_log(f"AUTO: FATAL VIBRATION during climb ({max(state['vibration_filtered']):.1f} m/s²)! KILLED.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
+            update_log(f"AUTO: FATAL VIB during climb ({max(state['vibration_filtered']):.1f})! KILL.")
+            emergency_disarm(master)
             return
-
-    # 8. Climb phase monitoring (with damping)
-    start_time = time.time()
-    
-    while True:
+    else:
+        # Loop ended via timeout (while condition became false)
         current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
-        alt_error = target_abs_alt - current_alt
-        
-        # Dampen climb aggressiveness when approaching target
-        if abs(alt_error) < CLIMB_DIST_THRESHOLD * 1.5:
-            # Use simplified P control to approach target gently
-            throttle_adj = int(alt_error * 60)  # Reduced from 80 for gentler control
-            state['rc_throttle'] = int(HOVER_THR + throttle_adj)
-        
-        if current_alt >= target_abs_alt:
-            update_log("AUTO: Target altitude reached.")
-            break
-        if time.time() - start_time > 6.0:
-            update_log("AUTO: Climb timeout reached. Stopping climb.")
-            break
+        update_log(f"AUTO: Climb timeout at {current_alt:.2f}m. Proceeding to hover.")
 
-        send_rc_override(master)
-        time.sleep(0.05)
+    if not state['armed']:
+        state['macro_status'] = 'IDLE'
+        return
 
-        # --- SAFETY KILL SWITCHES ---
-        if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
-            update_log("AUTO: CRITICAL TILT! EMERGENCY STOP.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
-            return
-            
-        max_vib = max(state['vibration_filtered'])
-        if max_vib > MAX_VIBRATION:
-            update_log(f"AUTO: FATAL VIBRATION ({max_vib:.1f} m/s²)! KILLED.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
-            return
-
-    # 9. Brake and engage hover
-    update_log("AUTO: Braking. Engaging hover.")
-    state['rc_throttle'] = HOVER_THR
-    send_rc_override(master)
-    time.sleep(0.5)
-
-    # 10. SET HOME POSITION FOR POSITION HOLD
-    set_home_position()
+    # 8. HOVER PHASE - Use LOITER for FC-native position hold
+    # LOITER mode uses EKF position estimate (from optical flow + rangefinder)
+    # to hold both altitude AND horizontal position. All sticks at 1500 = hold.
+    # This is MUCH better than ALT_HOLD (altitude only, no position hold).
+    total_hover_time = HOVER_SETTLE_TIME + HOVER_DURATION
+    update_log(f"AUTO: Switching to LOITER for position hold at {target_alt:.0f}m...")
     
-    # Switch to ALT_HOLD for active altitude and position control
-    update_log("AUTO: Activating ALT_HOLD for active position control...")
-    master.set_mode(master.mode_mapping()['ALT_HOLD'])
-    time.sleep(0.5)
-    
-    # 11. SETTLING PERIOD: Fine hover control with drift correction
-    update_log(f"AUTO: Settling at {TARGET_ALTITUDE}m with drift control for {HOVER_SETTLE_TIME}s...")
-    settle_start = time.time()
-    alt_integral = 0.0
-    prev_alt_error = 0.0
-    prev_time = time.time()
-    max_drift_recorded = 0.0
-    
-    while time.time() - settle_start < HOVER_SETTLE_TIME and state['armed']:
-        current_alt = get_best_altitude_for_control()
-        current_time = time.time()
-        dt = max(0.01, current_time - prev_time)
-        prev_time = current_time
-        update_position_estimate(dt)
-        
-        # --- ALTITUDE CONTROLLER (PID) ---
-        alt_error = target_abs_alt - current_alt
-        
-        if abs(alt_error) > ALT_DEADBAND:
-            alt_p = alt_error * ALT_PID_P
-            alt_integral += alt_error * dt
-            alt_integral = max(-30, min(30, alt_integral))
-            alt_i = alt_integral * ALT_PID_I
-            alt_d = (alt_error - prev_alt_error) / dt * ALT_PID_D if dt > 0 else 0
-            alt_d = max(-80, min(80, alt_d))
-            throttle_delta = alt_p + alt_i + alt_d
-        else:
-            throttle_delta = 0
-            alt_integral *= 0.95
-        
-        state['rc_throttle'] = int(max(1200, min(1750, HOVER_THR + throttle_delta)))
-        prev_alt_error = alt_error
-        
-        # --- POSITION HOLD (DRIFT CORRECTION) ---
-        roll_pwm, pitch_pwm = compute_position_correction(max_angle=4.0)
-        state['rc_roll'] = roll_pwm
-        state['rc_pitch'] = pitch_pwm
-        
-        # --- YAW STABILIZATION (Hold current heading) ---
-        # Prevent wild yaw oscillations by dampening heading changes
-        yaw_rate_of_change = abs(state['hdg'] - prev_alt_error) if hasattr(compute_position_correction, '__self__') else 0
-        if abs(state['hdg']) > YAW_RATE_LIMIT:
-            # If heading is changing too fast, center yaw to stabilize
-            state['rc_yaw'] = 1500
-        else:
-            # Normal operation - maintain neutral yaw for indoor STABILIZE/ALT_HOLD
-            state['rc_yaw'] = 1500
-        
-        send_rc_override(master)
-        time.sleep(0.05)
-        
-        # Monitor drift
-        drift = get_drift_magnitude()
-        if drift > max_drift_recorded:
-            max_drift_recorded = drift
-        if drift > 0.3 and (int(time.time() - settle_start)) % 2 == 0:
-            update_log(f"AUTO: Drift: {drift:.2f}m. Correcting...")
-        
-        # Safety checks
-        if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
-            update_log("AUTO: CRITICAL TILT during settle! Reducing corrections.")
-            alt_integral *= 0.5
-        
-        max_vib = max(state['vibration_filtered'])
-        if max_vib > MAX_VIBRATION:
-            update_log(f"AUTO: FATAL VIBRATION during settle ({max_vib:.1f} m/s²)! KILLED.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
-            return
-    
-    update_log(f"AUTO: Settled. Max drift during settle: {max_drift_recorded:.2f}m")
-    
-    # 12. STABLE HOVER PHASE: Maintain at target altitude and position
-    update_log(f"AUTO: {TARGET_ALTITUDE}m stable hover achieved. Holding position for {HOVER_DURATION}s...")
-    hover_start_time = time.time()
-    hover_frames = 0
-    hover_drift_samples = []
-    
-    while time.time() - hover_start_time < HOVER_DURATION and state['armed']:
-        current_alt = get_best_altitude_for_control()
-        current_time = time.time()
-        dt = max(0.01, current_time - prev_time)
-        prev_time = current_time
-        hover_frames += 1
-        update_position_estimate(dt)
-        
-        # --- ALTITUDE CONTROLLER ---
-        alt_error = target_abs_alt - current_alt
-        if abs(alt_error) > ALT_DEADBAND:
-            alt_p = alt_error * ALT_PID_P * 0.8  # Slightly reduced during hover
-            alt_integral += alt_error * dt
-            alt_integral = max(-20, min(20, alt_integral))
-            alt_i = alt_integral * ALT_PID_I * 0.9
-            alt_d = (alt_error - prev_alt_error) / dt * ALT_PID_D * 0.8 if dt > 0 else 0
-            throttle_delta = alt_p + alt_i + alt_d
-        else:
-            throttle_delta = 0
-            alt_integral *= 0.92
-        
-        state['rc_throttle'] = int(max(1200, min(1750, HOVER_THR + throttle_delta)))
-        prev_alt_error = alt_error
-        
-        # --- POSITION HOLD (DRIFT CORRECTION) ---
-        roll_pwm, pitch_pwm = compute_position_correction(max_angle=3.0)
-        state['rc_roll'] = roll_pwm
-        state['rc_pitch'] = pitch_pwm
-        
-        # --- YAW STABILIZATION (Hold current heading) ---
-        # Prevent wild yaw oscillations by keeping neutral yaw command
-        if abs(state['hdg']) > YAW_RATE_LIMIT:
-            # If heading is changing too fast, center yaw to stabilize
-            state['rc_yaw'] = 1500
-        else:
-            # Normal operation - maintain neutral yaw for stable heading hold
-            state['rc_yaw'] = 1500
-        
-        send_rc_override(master)
-        
-        # Log drift for analysis
-        drift = get_drift_magnitude()
-        hover_drift_samples.append(drift)
-        if len(hover_drift_samples) > 200:
-            hover_drift_samples.pop(0)
-        
-        time.sleep(0.05)
-        
-        # Safety checks
-        max_vib = max(state['vibration_filtered'])
-        if max_vib > MAX_VIBRATION:
-            update_log(f"AUTO: FATAL VIBRATION during hover ({max_vib:.1f} m/s²)! KILLED.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
-            return
-        
-        if state['batt_pct'] < 20:
-            update_log("AUTO: LOW BATTERY during hover! Triggering land...")
-            break
-    
-    avg_drift = sum(hover_drift_samples) / len(hover_drift_samples) if hover_drift_samples else 0.0
-    max_drift_hover = max(hover_drift_samples) if hover_drift_samples else 0.0
-    update_log(f"AUTO: Hover complete. Avg drift: {avg_drift:.3f}m, Max: {max_drift_hover:.3f}m")
-    
-    # 13. Initiate landing
-    update_log("AUTO: Hover complete. Initiating landing sequence...")
-    
-    while time.time() - hover_start_time < HOVER_DURATION and state['armed']:
-        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
-        current_time = time.time()
-        dt = max(0.01, current_time - prev_time)
-        prev_time = current_time
-        hover_frames += 1
-        
-        # --- MAINTAIN ALTITUDE with reduced aggressiveness ---
-        alt_error = target_abs_alt - current_alt
-        
-        if abs(alt_error) > ALT_DEADBAND:
-            alt_p = alt_error * ALT_PID_P
-            alt_integral += alt_error * dt
-            alt_integral = max(-25, min(25, alt_integral))  # Tighter clamp for stability
-            alt_i = alt_integral * ALT_PID_I
-            alt_d = (alt_error - prev_alt_error) / dt * ALT_PID_D if dt > 0 else 0
-            throttle_delta = alt_p + alt_i + alt_d
-        else:
-            throttle_delta = 0
-            alt_integral *= 0.97
-        
-        state['rc_throttle'] = int(max(1250, min(1750, HOVER_THR + throttle_delta)))
-        prev_alt_error = alt_error
-        
-        # --- MAINTAIN POSITION via Optical Flow ---
-        if state['flow_qual'] > 50:
-            flow_x = state['flow_vx']
-            flow_y = state['flow_vy']
-            
-            pos_integral_x += flow_x * dt
-            pos_integral_y += flow_y * dt
-            
-            pos_integral_x = max(-0.2, min(0.2, pos_integral_x))
-            pos_integral_y = max(-0.2, min(0.2, pos_integral_y))
-            
-            pitch_correction = (-flow_x * POS_P_GAIN - pos_integral_x * POS_INTEGRAL_GAIN) / 100
-            roll_correction = (-flow_y * POS_P_GAIN - pos_integral_y * POS_INTEGRAL_GAIN) / 100
-            
-            state['rc_pitch'] = int(max(1470, min(1530, 1500 + pitch_correction)))
-            state['rc_roll'] = int(max(1470, min(1530, 1500 + roll_correction)))
-        else:
+    # Retry LOITER mode switch up to 3 times
+    loiter_ok = False
+    for attempt in range(3):
+        master.set_mode(master.mode_mapping()['LOITER'])
+        # Keep sending RC overrides while waiting for mode switch
+        for _ in range(10):  # 0.5s with keepalive
+            state['rc_throttle'] = HOVER_THR
             state['rc_pitch'] = 1500
             state['rc_roll'] = 1500
+            state['rc_yaw'] = 1500
+            send_rc_override(master)
+            time.sleep(0.05)
         
+        if 'LOITER' in state['mode'].upper():
+            loiter_ok = True
+            break
+        update_log(f"AUTO: LOITER attempt {attempt+1}/3 failed, retrying...")
+    
+    if not loiter_ok:
+        update_log("AUTO: LOITER REJECTED by FC! No position hold available. Landing for safety.")
+        auto_land_sequence(master)
+        return
+    
+    update_log(f"AUTO: LOITER engaged. FC holding position for {total_hover_time:.0f}s...")
+    
+    state['rc_throttle'] = HOVER_THR  # 1500 = neutral = hold altitude
+    state['rc_pitch'] = 1500          # In LOITER: 1500 = hold position
+    state['rc_roll'] = 1500           # In LOITER: 1500 = hold position
+    state['rc_yaw'] = 1500
+    send_rc_override(master)
+    
+    set_home_position()
+    state['macro_status'] = 'HOVER'
+    
+    hover_start = time.time()
+    hover_drift_samples = []
+    last_log_time = time.time()
+    poor_flow_since = None
+    LOG_INTERVAL = 2.0
+    
+    while time.time() - hover_start < total_hover_time and state['armed'] and state['macro_status'] == 'HOVER':
+        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        
+        # ALL STICKS NEUTRAL - FC handles everything in LOITER
+        # In LOITER: pitch/roll 1500 = hold position (FC uses optical flow)
+        # In ALT_HOLD: pitch/roll 1500 = level (no position hold)
+        state['rc_throttle'] = HOVER_THR  # 1500
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
         send_rc_override(master)
+        
+        # Track drift for reporting
+        update_position_estimate(0.05)
+        drift = get_drift_magnitude()
+        hover_drift_samples.append(drift)
+        if len(hover_drift_samples) > 500:
+            hover_drift_samples.pop(0)
+        
+        # Periodic logging
+        if time.time() - last_log_time > LOG_INTERVAL:
+            elapsed = time.time() - hover_start
+            vib_now = max(state['vibration_filtered'])
+            phase = "SETTLE" if elapsed < HOVER_SETTLE_TIME else "HOVER"
+            update_log(f"{phase}: [{elapsed:.0f}s] Alt={current_alt:.2f}m Drift={drift:.2f}m Vib={vib_now:.1f}")
+            last_log_time = time.time()
+
+        # Position hold depends on optical-flow quality; land safely on sustained dropout.
+        if state['flow_qual'] < 40:
+            if poor_flow_since is None:
+                poor_flow_since = time.time()
+            elif time.time() - poor_flow_since > 2.0:
+                update_log("AUTO: Optical-flow degraded during hover. Landing for safety.")
+                auto_land_sequence(master)
+                return
+        else:
+            poor_flow_since = None
+        
         time.sleep(0.05)
         
-        # Monitor safety conditions
-        if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
-            update_log("AUTO: CRITICAL TILT during hover! EMERGENCY STOP.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
+        # Safety: vibration
+        if max(state['vibration_filtered']) > MAX_VIBRATION:
+            update_log(f"AUTO: FATAL VIB during hover ({max(state['vibration_filtered']):.1f})! KILL.")
+            emergency_disarm(master)
             return
-            
-        max_vib = max(state['vibration_filtered'])
-        if max_vib > MAX_VIBRATION:
-            update_log(f"AUTO: FATAL VIBRATION during hover ({max_vib:.1f} m/s²)! KILLED.")
-            state['rc_throttle'] = 1000
-            send_rc_override(master)
-            master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
-            state['macro_status'] = 'IDLE'
+        # Safety: tilt
+        if abs(state['roll']) > 40 or abs(state['pitch']) > 40:
+            update_log("AUTO: CRITICAL TILT during hover! KILL.")
+            emergency_disarm(master)
             return
-        
-        # Log every 2 seconds (less verbose)
-        if hover_frames % 40 == 0:
-            flow_mag = math.sqrt(state['flow_vx']**2 + state['flow_vy']**2)
-            elapsed = time.time() - hover_start_time
-            vib_display = max(state['vibration_filtered'])
-            update_log(f"AUTO: Hover [{elapsed:.1f}s] Alt={current_alt:.2f}m Thr={state['rc_throttle']} Vib={vib_display:.2f} Flow={flow_mag:.3f}m/s")
+        # Safety: battery - only trigger on actual dangerously low voltage
+        # NOT on percentage (12% at 12V is normal for a 4S LiPo)
+        if state['batt_v'] > 1.0 and state['batt_v'] < MIN_SAFE_VOLTAGE:
+            update_log(f"AUTO: CRITICAL VOLTAGE {state['batt_v']:.1f}V! Landing now.")
+            break
     
-    update_log("AUTO: 10-second hover complete. Initiating landing sequence...")
+    avg_drift = sum(hover_drift_samples) / max(1, len(hover_drift_samples))
+    max_drift = max(hover_drift_samples) if hover_drift_samples else 0
+    update_log(f"AUTO: Hover complete. Avg drift: {avg_drift:.3f}m, Max: {max_drift:.3f}m")
     
-    # Automatically transition to landing sequence
-    auto_land_sequence(master)
+    # 9. Transition to landing (only if not already started by 'j' key)
+    if state['macro_status'] == 'HOVER':
+        update_log("AUTO: Initiating landing sequence...")
+        auto_land_sequence(master)
 
 
 def auto_land_sequence(master):
-    """Precision landing with position hold and drift prevention."""
-    if state['macro_status'] not in ['IDLE', 'HOVER', None]:
-        return  # Prevent double-triggering
+    """Controlled landing using ArduCopter's LAND mode.
+    
+    LAND mode handles everything internally:
+    - Descends at LAND_SPEED (FC parameter, default 50 cm/s)
+    - Maintains horizontal position hold (like LOITER)
+    - Handles ground effect and rangefinder fusion via EKF
+    - Auto-detects touchdown and disarms
+    
+    Previous attempts to manually descend in LOITER failed because:
+    - Throttle 1440 was inside FC's THR_DZ deadband (±100 around 1500)
+    - Rangefinder spikes caused FC altitude overcorrection
+    - Python descent braking fought FC's altitude controller
+    
+    SAFETY: Loop exits immediately if KILL switch sets macro_status to IDLE.
+    """
+    # Guard: only allow landing from HOVER or IDLE states
+    if state['macro_status'] not in ('IDLE', 'HOVER'):
+        update_log("LAND: Cannot land during " + state['macro_status'] + ". Use 'x' to abort.")
+        return
+    
+    # Guard: must be armed and airborne
+    if not state['armed']:
+        update_log("LAND: Not armed. Nothing to do.")
+        return
+    
+    current_check_alt = get_best_altitude_for_control()
+    if current_check_alt < 0.10:
+        update_log("LAND: Already on ground. Disarming.")
+        emergency_disarm(master)
+        return
     
     state['macro_status'] = 'LANDING'
     
-    update_log("AUTO: Starting precision landing sequence...")
+    update_log("AUTO: Switching to LAND mode...")
     
-    # Ensure home is set for position hold during descent
-    if not state['home_set']:
-        set_home_position()
+    # Switch to LAND mode — FC handles descent, position hold, and touchdown
+    master.set_mode(master.mode_mapping()['LAND'])
     
-    # Switch to ALT_HOLD for active descent control
-    master.set_mode(master.mode_mapping()['ALT_HOLD'])
-    time.sleep(0.5)
+    # All sticks neutral — FC controls everything in LAND mode
+    state['rc_throttle'] = 1500
+    state['rc_pitch'] = 1500
+    state['rc_roll'] = 1500
+    state['rc_yaw'] = 1500
+    send_rc_override(master)
     
-    update_log("AUTO: Descending to ground with position hold...")
-    
-    land_start = time.time()
-    timeout = land_start + 30  # 30 second timeout for landing
-    land_alt_integral = 0.0
-    prev_land_alt_error = 0.0
-    prev_land_time = time.time()
-    touchdown_frames = 0
-    
-    while state['armed'] and time.time() < timeout:
-        current_alt = get_best_altitude_for_control()
-        current_time = time.time()
-        dt = max(0.01, current_time - prev_land_time)
-        prev_land_time = current_time
-        update_position_estimate(dt)
-        
-        descent_rate = 0.2  # Smooth descent at 0.2 m/s
-        target_alt = state['home_z'] - (time.time() - land_start) * descent_rate
-        target_alt = max(0.0, target_alt)  # Don't go below ground
-        
-        # --- ALTITUDE CONTROLLER FOR DESCENT ---
-        alt_error = target_alt - current_alt
-        
-        # Proportional only for descent (smoother than PID)
-        throttle_delta = alt_error * 40  # Reduced from 60 for softer descent
-        
-        state['rc_throttle'] = int(max(1100, min(1600, HOVER_THR + throttle_delta)))
-        
-        # --- POSITION HOLD DURING DESCENT ---
-        roll_pwm, pitch_pwm = compute_position_correction(max_angle=3.0)
-        state['rc_roll'] = roll_pwm
-        state['rc_pitch'] = pitch_pwm
-        
+    # Wait for mode switch confirmation
+    for _ in range(10):  # 0.5s with RC keepalive
         send_rc_override(master)
         time.sleep(0.05)
+    
+    if 'LAND' in state['mode'].upper():
+        update_log("AUTO: LAND mode engaged. FC handling descent...")
+    else:
+        update_log(f"AUTO: LAND mode requested (current: {state['mode']}). Monitoring...")
+    
+    land_start = time.time()
+    LAND_TIMEOUT = 30.0
+    last_log_time = time.time()
+    
+    while state['armed'] and time.time() - land_start < LAND_TIMEOUT:
+        # EXIT IMMEDIATELY if KILL switch was pressed
+        if state['macro_status'] != 'LANDING':
+            update_log("LAND: Aborted — KILL switch or mode change.")
+            return
         
-        # Touchdown detection: Near ground AND vertical velocity low
-        if current_alt < 0.20 and abs(state['climb']) < 0.10:
-            touchdown_frames += 1
-            if touchdown_frames % 5 == 0:  # Log every 0.25 seconds
-                update_log(f"AUTO: Near ground. Velocity: {state['climb']:.2f} m/s")
+        current_alt = get_best_altitude_for_control()
+        
+        # TILT SAFETY: if drone tilts > 30° during landing, emergency disarm
+        if abs(state['roll']) > 30 or abs(state['pitch']) > 30:
+            update_log(f"LAND: TILT ABORT Roll={state['roll']:.0f}° Pitch={state['pitch']:.0f}°")
+            emergency_disarm(master)
+            return
+        
+        # All sticks neutral — let FC handle everything
+        state['rc_throttle'] = 1500
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
+        send_rc_override(master)
+        
+        # Periodic logging
+        if time.time() - last_log_time > 2.0:
+            update_log(f"LAND: Alt={current_alt:.2f}m Mode={state['mode']} Climb={state['climb']:.2f}")
+            last_log_time = time.time()
+        
+        time.sleep(0.05)
+    
+    # EXIT IMMEDIATELY if KILL was pressed while in loop
+    if state['macro_status'] != 'LANDING':
+        return
+    
+    if not state['armed']:
+        # FC auto-disarmed on touchdown — success!
+        update_log("AUTO: Touchdown! FC auto-disarmed. Landing complete.")
+        state['macro_status'] = 'IDLE'
+        state['home_set'] = False
+    elif time.time() - land_start >= LAND_TIMEOUT:
+        update_log("AUTO: Landing timeout. Force disarming...")
+        emergency_disarm(master)
+    
+    update_log("AUTO: Landing sequence finished.")
+
+
+def auto_move_sequence(master, direction):
+    """Move ~1 meter in specified direction using LOITER stick deflection.
+    
+    In LOITER mode, pitch/roll stick deflection from 1500 commands a velocity.
+    We tilt the stick for a calibrated duration, then return to neutral and let
+    the FC (LOITER) brake and hold the new position.
+    
+    direction: 'front', 'back', 'left', 'right'
+    
+    Only works when in HOVER state (armed + LOITER mode).
+    """
+    if state['macro_status'] != 'HOVER':
+        update_log(f"MOVE: Cannot move — must be in HOVER state (current: {state['macro_status']})")
+        return
+    
+    if not state['armed']:
+        update_log("MOVE: Not armed.")
+        return
+    
+    if 'LOITER' not in state['mode'].upper():
+        update_log(f"MOVE: Not in LOITER mode (current: {state['mode']}). Cannot move.")
+        return
+    
+    # Stick deflection and duration to produce ~1m movement
+    # LOITER interprets stick deflection as velocity command.
+    # Moderate deflection (~100 PWM from center) for a short duration.
+    MOVE_DEFLECTION = 100   # PWM units from 1500 center
+    MOVE_DURATION = 0.8     # Seconds of stick input (tune on real drone)
+    BRAKE_SETTLE = 1.0      # Seconds to let FC brake and settle
+    
+    direction_map = {
+        'front': ('rc_pitch', 1500 - MOVE_DEFLECTION),   # Pitch forward = lower PWM
+        'back':  ('rc_pitch', 1500 + MOVE_DEFLECTION),   # Pitch back = higher PWM
+        'left':  ('rc_roll',  1500 - MOVE_DEFLECTION),   # Roll left = lower PWM
+        'right': ('rc_roll',  1500 + MOVE_DEFLECTION),   # Roll right = higher PWM
+    }
+    
+    if direction not in direction_map:
+        update_log(f"MOVE: Unknown direction '{direction}'")
+        return
+    
+    channel, pwm_value = direction_map[direction]
+    state['macro_status'] = 'MOVING'
+    update_log(f"MOVE: Moving {direction} ~1m...")
+    
+    # Apply stick deflection for MOVE_DURATION
+    move_start = time.time()
+    while time.time() - move_start < MOVE_DURATION:
+        if state['macro_status'] == 'IDLE':  # KILL switch
+            return
+        
+        state[channel] = pwm_value
+        state['rc_throttle'] = 1500  # Maintain altitude
+        state['rc_yaw'] = 1500
+        # Keep the other axis neutral
+        if channel == 'rc_pitch':
+            state['rc_roll'] = 1500
         else:
-            touchdown_frames = 0
+            state['rc_pitch'] = 1500
+        send_rc_override(master)
         
-        # Confirm touchdown: 0.5 seconds of zero vertical movement near ground
-        if touchdown_frames > 10:
-            update_log("AUTO: Touchdown confirmed. Disarming...")
+        # Safety: tilt check
+        if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
+            update_log("MOVE: TILT ABORT! Returning to hover.")
             break
         
-        # Safety: don't land indefinitely
-        if time.time() - land_start > 25:
-            update_log("AUTO: Landing timeout. Force disarming...")
-            break
+        time.sleep(0.05)
     
-    # Final disarm
-    state['rc_throttle'] = 1000
-    state['rc_roll'] = 1500
+    # Return all sticks to neutral — FC will brake in LOITER
     state['rc_pitch'] = 1500
+    state['rc_roll'] = 1500
+    state['rc_throttle'] = 1500
+    state['rc_yaw'] = 1500
     send_rc_override(master)
-    time.sleep(0.5)
     
-    master.mav.command_long_send(
-        master.target_system, master.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
-    )
+    update_log(f"MOVE: Stick released. FC braking...")
     
-    update_log("AUTO: Disarmed. Landing complete.")
-    state['macro_status'] = 'IDLE'
-    state['home_set'] = False  # Reset home after landing
+    # Let FC settle at new position
+    settle_start = time.time()
+    while time.time() - settle_start < BRAKE_SETTLE:
+        if state['macro_status'] == 'IDLE':
+            return
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_throttle'] = 1500
+        state['rc_yaw'] = 1500
+        send_rc_override(master)
+        time.sleep(0.05)
+    
+    current_alt = get_best_altitude_for_control()
+    update_log(f"MOVE: {direction} complete. Alt: {current_alt:.2f}m")
+    state['macro_status'] = 'HOVER'
 
 
 # --- MAVLINK DATA PROCESSING ---
@@ -1205,7 +1469,26 @@ def mavlink_loop(master):
             dist_cm = msg.current_distance
             max_cm  = msg.max_distance
             if dist_cm < max_cm:
-                state['lidar_alt'] = round(dist_cm / 100.0, 2)
+                new_alt = round(dist_cm / 100.0, 2)
+
+                # Reject abrupt lidar jumps, then low-pass to reduce control jitter.
+                prev_raw = state['lidar_alt_raw']
+                if prev_raw > 0 and abs(new_alt - prev_raw) > MAX_LIDAR_STEP_M:
+                    state['lidar_spike_count'] = state.get('lidar_spike_count', 0) + 1
+                    if state['lidar_spike_count'] < 3:
+                        new_alt = prev_raw
+                    else:
+                        state['lidar_spike_count'] = 0
+                else:
+                    state['lidar_spike_count'] = 0
+
+                state['lidar_alt_raw'] = new_alt
+                if state['lidar_alt'] <= 0:
+                    state['lidar_alt'] = new_alt
+                else:
+                    state['lidar_alt'] = round(low_pass(state['lidar_alt'], new_alt, LIDAR_LPF_ALPHA), 3)
+
+                state['lidar_last_update'] = time.time()
                 state['rangefinder_healthy'] = True
             else:
                 state['rangefinder_healthy'] = False
@@ -1221,8 +1504,27 @@ def mavlink_loop(master):
 
         elif m_type == 'OPTICAL_FLOW':
             state['flow_qual'] = msg.quality
-            state['flow_vx']   = round(msg.flow_comp_m_x, 3)
-            state['flow_vy']   = round(msg.flow_comp_m_y, 3)
+            raw_vx = float(msg.flow_comp_m_x)
+            raw_vy = float(msg.flow_comp_m_y)
+            state['flow_vx_raw'] = round(raw_vx, 3)
+            state['flow_vy_raw'] = round(raw_vy, 3)
+            state['flow_last_update'] = time.time()
+
+            if state['flow_qual'] < 30:
+                state['flow_vx'] = 0.0
+                state['flow_vy'] = 0.0
+            else:
+                # Clamp unrealistic bursts observed in logs while keeping valid motion.
+                clamped_vx = max(-FLOW_SPIKE_REJECT_MPS, min(FLOW_SPIKE_REJECT_MPS, raw_vx))
+                clamped_vy = max(-FLOW_SPIKE_REJECT_MPS, min(FLOW_SPIKE_REJECT_MPS, raw_vy))
+
+                if abs(raw_vx) > FLOW_SPIKE_REJECT_MPS or abs(raw_vy) > FLOW_SPIKE_REJECT_MPS:
+                    state['flow_spike_count'] = state.get('flow_spike_count', 0) + 1
+                else:
+                    state['flow_spike_count'] = 0
+
+                state['flow_vx'] = round(low_pass(state['flow_vx'], clamped_vx, FLOW_LPF_ALPHA), 3)
+                state['flow_vy'] = round(low_pass(state['flow_vy'], clamped_vy, FLOW_LPF_ALPHA), 3)
 
         elif m_type == 'VISION_POSITION_ESTIMATE':
             state['vision_x'] = round(msg.x, 2)
@@ -1284,7 +1586,10 @@ def mavlink_loop(master):
             update_vibration_filter(state['vibration'])
 
         elif m_type == 'STATUSTEXT':
-            update_log(f"SYS: {msg.text}")
+            # Filter repetitive FC messages that flood the event log
+            text = msg.text
+            if 'Field Elevation Set' not in text:
+                update_log(f"SYS: {text}")
 
 
 # --- TUI DASHBOARD ---
@@ -1444,6 +1749,12 @@ def draw_dashboard(stdscr, master):
         safe_add(row, 2, livox_stat, health_color_livox)
         safe_add(row, 30, f"EKF: 0x{state['ekf_flags']:04X}  Vision: {format_position_compact(state['vision_x'], state['vision_y'], state['vision_z'])}", c_neu)
         row += 1
+        
+        # Livox ML Data Collection Status
+        livox_ml_stat = f"ML DATA: PC_Frames:{state['livox_pc_frames']:6d}  Last:{state['livox_pc_last_pts']:6d}pts  IMU:{state['livox_imu_samples']:8d}smpls"
+        ml_color = c_ok if state['livox_pc_frames'] > 0 else c_neu
+        safe_add(row, 2, livox_ml_stat, ml_color)
+        row += 1
 
         # ============ VIBRATION & PERFORMANCE ============
         safe_add(row, 0, mid, c_info)
@@ -1497,10 +1808,10 @@ def draw_dashboard(stdscr, master):
         safe_add(row, 2, rc_line, c_info)
         row += 1
         
-        safe_add(row, 2, "[MISSION] k=Takeoff  j=Land  [MODE] h=AltHold  l=Loiter  [CONTROL] a=Arm  d=Disarm  x=KILL  q=Quit", c_warn)
+        safe_add(row, 2, "[TAKEOFF] 1=1m  2=2m  j=Land  [MOVE] i=Fwd  ,=Back  ;=Left  '=Right  [CTRL] a=Arm  d=Disarm  x=KILL  q=Quit", c_warn)
         row += 1
         
-        safe_add(row, 2, "[MANUAL] W/S=Pitch  A/D=Roll  ↑↓=Throttle  [DEBUG] r=ROS2  e=Export  c=CalGyr  o=Origin  SPACE=Hover", c_warn)
+        safe_add(row, 2, "[MODE] h=AltHold  l=Loiter  [MANUAL] W/S=Pitch  ↑↓=Thr  SPACE=Hover  [DBG] r=ROS2  e=Export  c=Cal  o=Origin", c_warn)
         row += 2
 
         # ============ EVENT LOG ============
@@ -1522,10 +1833,12 @@ def draw_dashboard(stdscr, master):
         
         key = stdscr.getch()
 
-        # Reset sticks to neutral each cycle
-        state['rc_pitch'] = 1500
-        state['rc_roll']  = 1500
-        state['rc_yaw']   = 1500
+        # Reset sticks to neutral ONLY when not in autonomous mode
+        # During autonomous flight, the flight thread controls all sticks
+        if state['macro_status'] == 'IDLE':
+            state['rc_pitch'] = 1500
+            state['rc_roll']  = 1500
+            state['rc_yaw']   = 1500
 
         if key != -1:
             if key == ord('q'):
@@ -1570,6 +1883,18 @@ def draw_dashboard(stdscr, master):
                 update_log("CMD: DISARM requested.")
             elif key == ord('k'):
                 threading.Thread(target=auto_takeoff_sequence, args=(master,), daemon=True).start()
+            elif key == ord('1'):
+                threading.Thread(target=auto_takeoff_sequence, args=(master, 1.0), daemon=True).start()
+            elif key == ord('2'):
+                threading.Thread(target=auto_takeoff_sequence, args=(master, 2.0), daemon=True).start()
+            elif key == ord('i'):
+                threading.Thread(target=auto_move_sequence, args=(master, 'front'), daemon=True).start()
+            elif key == ord(','):
+                threading.Thread(target=auto_move_sequence, args=(master, 'back'), daemon=True).start()
+            elif key == ord(';'):
+                threading.Thread(target=auto_move_sequence, args=(master, 'left'), daemon=True).start()
+            elif key == ord("'"):
+                threading.Thread(target=auto_move_sequence, args=(master, 'right'), daemon=True).start()
             elif key == ord('j'):
                 threading.Thread(target=auto_land_sequence, args=(master,), daemon=True).start()
             elif key == ord('n'):
@@ -1591,13 +1916,17 @@ def draw_dashboard(stdscr, master):
                 state['rc_throttle'] = HOVER_THR
                 update_log("CMD: Throttle set to hover neutral.")
             elif key == ord('x'):
-                state['rc_throttle'] = 1000
-                state['macro_status'] = 'IDLE'
                 update_log("CMD: *** EMERGENCY KILL SWITCH TRIGGERED ***")
-                master.mav.command_long_send(
-                    master.target_system, master.target_component,
-                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
-                )
+                state['macro_status'] = 'IDLE'  # Stop all autonomous threads FIRST
+                state['rtl_active'] = False      # Cancel any RTL
+                emergency_disarm(master)
+                # Send force-disarm multiple times to ensure FC complies
+                for _ in range(5):
+                    master.mav.command_long_send(
+                        master.target_system, master.target_component,
+                        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 21196, 0, 0, 0, 0, 0
+                    )
+                    time.sleep(0.05)
             elif key == ord('r'):
                 # ROS2 diagnostics & telemetry summary
                 if ROS2_AVAILABLE:
@@ -1643,7 +1972,9 @@ def draw_dashboard(stdscr, master):
                     f.write(f"  Point Cloud: {state['fastlio_points']:,} pts/scan\n")
                 update_log(f"Diagnostics exported to {export_log}")
 
-        send_rc_override(master)
+        # Only send RC overrides from dashboard when not in autonomous mode
+        if state['macro_status'] == 'IDLE':
+            send_rc_override(master)
         time.sleep(0.05)
 
 
@@ -1652,26 +1983,26 @@ def draw_dashboard(stdscr, master):
 if __name__ == '__main__':
     try:
         print("\n" + "="*70)
-        print("  ASCEND MISSION CONTROL v8.0 - FAST-LIO Edition (Livox Mid-360)")
+        print("  ASCEND MISSION CONTROL v8.0 - Rangefinder + Optical Flow")
         print("="*70)
         
-        # Start ROS2 FAST-LIO subscriber if available
+        # Start ROS2 FAST-LIO subscriber if available (optional)
         if ROS2_AVAILABLE:
-            print("\n[*] ROS2 Environment: DETECTED")
-            print("    Make sure FAST-LIO is running:")
-            print("      $ ros2 launch fast_lio mapping_mid360.launch.py")
-            print("    And the drone bridge is active:")
-            print("      $ ros2 launch mavros px4.launch")
-            print("\n[*] Starting ROS2 FAST-LIO subscriber thread...")
-            
+            print("\n[*] ROS2 detected. Starting FAST-LIO subscriber (optional)...")
             ros2_thread = threading.Thread(target=run_ros2_thread, daemon=True)
             ros2_thread.start()
-            time.sleep(2.0)  # Give ROS2 more time to initialize and connect to master
+            time.sleep(2.0)
         else:
-            print("\n[!] WARNING: ROS2 (rclpy) not available.")
-            print("    Install with: pip install rclpy")
-            print("    Without ROS2, FAST-LIO SLAM data will be unavailable.")
-            time.sleep(1.0)
+            print("\n[!] ROS2 Python modules not available in current shell.")
+            print("    FAST-LIO/Livox logging will be disabled for this run.")
+            if ROS2_IMPORT_ERROR:
+                print(f"    Import error: {ROS2_IMPORT_ERROR}")
+            print("    Source env before launch:")
+            print("    source /home/iic5/.venv/bin/activate")
+            print("    source /home/iic5/ros2_humble/install/setup.bash")
+            print("    source /home/iic5/slam_ws/install/setup.bash")
+            print("\n[*] Running with Rangefinder + Optical Flow (no SLAM).")
+            time.sleep(0.5)
 
         print("\n[*] Connecting to Pixhawk on /dev/ttyAMA0 @ 921600 baud...")
         master_conn = mavutil.mavlink_connection('/dev/ttyAMA0', baud=921600)
@@ -1695,6 +2026,10 @@ if __name__ == '__main__':
         print("\n[*] Shutting down gracefully...")
         telemetry_file.close()
         event_file.close()
+        # Close Livox data files
+        livox_pc_file.close()
+        livox_imu_file.close()
+        print(f"[*] Livox data saved: {state['livox_pc_frames']} point cloud frames, {state['livox_imu_samples']} IMU samples")
         if ROS2_AVAILABLE:
             state['ros2_active'] = False
             try:
@@ -1703,3 +2038,6 @@ if __name__ == '__main__':
             except:
                 pass
         print("[*] Goodbye!")
+
+
+
