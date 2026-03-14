@@ -1,144 +1,115 @@
-# Drone Project
+# 🚁 Drone Project
 
-Autonomous drone control platform for quadcopters using MAVLink protocol and Pixhawk flight controllers. Includes real-time telemetry monitoring, LiDAR integration, and edge ML inference capabilities.
+The Drone Project is a comprehensive platform for autonomous quadcopter control, real-time telemetry visualization, and LiDAR-based obstacle detection. It leverages the MAVLink protocol for communication with Pixhawk flight controllers and integrates edge ML capabilities.
 
-## Features
+---
 
-- 🚁 **MAVLink Protocol Integration** – Direct communication with Pixhawk flight controller
-- 📊 **Real-Time Telemetry** – Web dashboard with SocketIO streaming
-- 📹 **LiDAR Integration** – Livox LiDAR support for obstacle detection
-- 🤖 **Edge ML** – TensorFlow Lite model inference on Raspberry Pi
-- 📝 **Flight Logging** – Comprehensive telemetry and event logging
-- 🎮 **Terminal UI** – Interactive control interface for arm/disarm/mode changes
-- 🧪 **Test Suite** – Hardware health checks and communication validation
+## 🚀 Quick Start (In 30 Seconds)
 
-## Quick Start
+1.  **Launch the Telemetry Analyzer:**
+    ```bash
+    ./scripts/run_analyzer.sh
+    ```
+2.  **Access the Dashboard:** Open `http://localhost:8501` in your browser.
+3.  **Explore Data:** Use the sidebar to load the included `data/sample_flight_log.csv`.
 
-### Prerequisites
-- Pixhawk flight controller (ArduCopter)
-- Raspberry Pi 4B+ (8GB recommended)
-- Python 3.9+
-- USB serial adapter or GPIO serial connection
+---
 
-### Installation
+## ✨ Features
+
+- 🛰️ **MAVLink Integration**: Direct interface with ArduCopter/Pixhawk.
+- 📊 **Telemetry Dashboard**: High-performance visualization with Streamlit.
+- 📡 **LiDAR Support**: Real-time pointcloud recording and obstacle avoidance.
+- 🤖 **Edge ML**: Onboard inference for autonomous mission logic.
+- 🎮 **Hybrid Control**: TUI (Terminal UI) and Web Dashboard.
+
+---
+
+## 📂 Project Structure
+
+```text
+drone-project/
+├── src/            # Core application source code
+│   ├── ascend_tui.py        # Main Terminal Mission Control (v1)
+│   ├── ascend_tui_v2.py     # Modern Terminal Mission Control (v2)
+│   └── ...                  # MAVLink and Sensor drivers
+├── docs/           # Comprehensive documentation & guides
+│   ├── SETUP.md             # Hardware/Software install guide
+│   ├── QUICKSTART.md        # Detailed dashboard walkthrough
+│   └── ...                  # Flight analysis & reports
+├── tools/          # Analysis and utility tools
+│   └── telemetry_analyzer.py # Streamlit Dashboard
+├── scripts/        # Automation and launcher scripts
+│   └── run_analyzer.sh       # Telemetry app launcher
+├── data/           # Telemetry logs and datasets
+└── tests/          # Unit and integration tests
+```
+
+---
+
+## 🛠️ Hardware Requirements
+
+- **Flight Controller**: Pixhawk (Cube, 6C, or similar) running ArduCopter.
+- **Companion Computer**: Raspberry Pi 4B (4GB+ recommended).
+- **Sensors**: Livox Mid-360 LiDAR (Optional), Optical Flow.
+
+---
+
+## 💻 Installation
 
 ```bash
+# Clone the repository
 git clone https://github.com/harsh-pandhe/drone-project.git
 cd drone-project
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
+# Setup environment
+python3 -m venv .venv
+source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### Verify Connection
+---
 
+## 🎮 Basic Usage
+
+### Verify Pixhawk Connection
 ```bash
 python3 src/check_connection.py
 ```
 
-### Run Server
-
+### Start Mission Control (TUI)
 ```bash
-python3 src/ascend_server.py
-# Visit http://localhost:5000
+python3 src/ascend_tui_v2.py
 ```
 
-## Directory Structure
-
-```
-drone-project/
-├── src/                    # Main application code
-│   ├── ascend_server.py    # Flask/SocketIO web server
-│   ├── ascend_tui.py       # Terminal user interface
-│   ├── ascend_autoflight.py # Autonomous flight logic
-│   ├── log_flight_data.py  # Data logging utilities
-│   └── ...                 # Other utilities
-├── tests/                  # Test suites
-├── config/                 # Pixhawk parameters & logs
-├── data/                   # Flight data (gitignored)
-│   ├── telemetry/          # CSV telemetry dumps
-│   ├── events/             # Text event logs
-│   ├── livox/              # LiDAR scan data
-│   └── raw/                # Other raw logs
-├── models/                 # ML models (e.g. TFLite)
-├── README.md               # This file
-├── SETUP.md                # Detailed setup guide
-├── CONTRIBUTING.md         # Contribution guidelines
-├── requirements.txt        # Python dependencies
-└── LICENSE                 # MIT License
-```
-
-## Key Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `src/ascend_server.py` | Web dashboard server on port 5000 |
-| `src/ascend_tui.py` | Interactive terminal interface |
-| `src/log_flight_data.py` | Record telemetry to CSV |
-| `src/check_connection.py` | Verify Pixhawk connectivity |
-| `src/pi_data_streamer.py` | Stream sensor data from Pi |
-| `src/record_livox.py` | Capture LiDAR scans |
-
-## Documentation
-
-- **[SETUP.md](SETUP.md)** – Hardware wiring, software install, troubleshooting
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** – Development guidelines, how to contribute
-- **[config/mav.parm](config/mav.parm)** – Pixhawk parameter export
-
-## MAVLink Connection
-
-Default serial configuration:
-- **Port**: `/dev/ttyAMA0` (or `/dev/serial0`)
-- **Baud Rate**: 57600, 115200, or 921600 (check firmware)
-- **Protocol**: MAVLink v2
-
-## Testing
-
+### Analyze Flight Logs
 ```bash
-# Run all tests
-pytest tests/
-
-# Run with coverage
-pytest --cov=src tests/
+./scripts/run_analyzer.sh
 ```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│         Web Browser (http://localhost:5000)  │
-├─────────────────────────────────────────────┤
-│ Flask/SocketIO Server (ascend_server.py)    │
-├─────────────────────────────────────────────┤
-│ MAVLink Protocol (pymavlink/mavsdk)         │
-├─────────────────────────────────────────────┤
-│ Pixhawk Flight Controller (via serial)      │
-├─────────────────────────────────────────────┤
-│ Sensors: GPS, IMU, Barometer, Compass       │
-└─────────────────────────────────────────────┘
-
-Optional components:
-- Livox LiDAR (obstacle detection)
-- Edge TPU (ML inference)
-- ROS2 Humble (for advanced autonomy)
-```
-
-## License
-
-MIT License – See [LICENSE](LICENSE) file for details.
-
-## Support
-
-- 📖 Check [SETUP.md](SETUP.md) for hardware/software guides
-- 🐛 Report issues on [GitHub Issues](https://github.com/harsh-pandhe/drone-project/issues)
-- 💬 See [CONTRIBUTING.md](CONTRIBUTING.md) for development questions
 
 ---
 
-**Author**: harsh-pandhe  
-**Email**: harshpandhehome@gmail.com  
-**Repository**: https://github.com/harsh-pandhe/drone-project
+## 📚 Documentation Hub
+
+Explore the `docs/` folder for detailed guides:
+
+- 🏗️ **[SETUP.md](docs/SETUP.md)**: Hardware wiring and software initialization.
+- 📈 **[QUICKSTART.md](docs/QUICKSTART.md)**: Using the Telemetry Visualizer.
+- 🚁 **[READY_TO_FLY.md](docs/READY_TO_FLY.md)**: Pre-flight checklist and 1m hover test.
+- 🛠️ **[FIXES_APPLIED.md](docs/FIXES_APPLIED.md)**: Technical history of implemented improvements.
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see **[CONTRIBUTING.md](CONTRIBUTING.md)** for development standards and pull request processes.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the **[LICENSE](LICENSE)** file for details.
+
+---
+**Author**: [Harsh Pandhe](https://github.com/harsh-pandhe)  
+**Email**: harshpandhehome@gmail.com

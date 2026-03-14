@@ -4,6 +4,10 @@ import curses
 import csv
 import math
 import struct
+import argparse
+import os
+import re
+import glob
 from datetime import datetime
 from pymavlink import mavutil
 
@@ -61,6 +65,9 @@ YAW_INTEGRAL_LIMIT = 30   # Max accumulated yaw error
 # --- FAST-LIO & SLAM ---
 FASTLIO_TIMEOUT = 3.0     # Seconds before FAST-LIO is considered unhealthy
 SLAM_WARN_INTERVAL = 5.0  # Minimum seconds between SLAM warning messages
+FASTLIO_MIN_HEALTHY_HZ = 5.0
+FASTLIO_STALE_WARN_SEC = 1.5
+SLAM_MAX_ALT_DIFF = 1.0
 
 # --- LOG-DRIVEN SAFETY FILTERS ---
 MIN_PREFLIGHT_FLOW_QUAL = 80   # Require stable flow before autonomous takeoff
@@ -75,6 +82,20 @@ NO_CLIMB_ABORT_SEC = 2.5       # Abort if no climb response for this long
 # Flight control must remain Rangefinder + Optical Flow only.
 # Livox/FAST-LIO is recorded for ML and monitoring, not used for control decisions.
 USE_FASTLIO_FOR_CONTROL = False
+# Enable weighted multi-sensor fusion for altitude supervision during autonomy.
+# This still favors rangefinder + flow, but adds SLAM/baro to reject spikes.
+USE_MULTISENSOR_CONTROL = True
+MAX_ALT_SENSOR_DISAGREE = 0.8
+LIVOX_MIN_SAFE_DIST = 0.8
+
+# --- ARCHIVE DATA FUSION ---
+ARCHIVE_REFRESH_SEC = 8.0
+LFS_POINTER_HEADER = "version https://git-lfs.github.com/spec/v1"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
+TELEMETRY_DIR = os.path.join(DATA_ROOT, "telemetry")
+EVENTS_DIR = os.path.join(DATA_ROOT, "events")
+LIVOX_DIR = os.path.join(DATA_ROOT, "livox")
 
 # --- LOGGING INITIALIZATION ---
 session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -135,7 +156,15 @@ state = {
     'fastlio_roll': 0.0, 'fastlio_pitch': 0.0, 'fastlio_yaw': 0.0,
     'fastlio_points': 0, 'fastlio_healthy': False, 'fastlio_hz': 0.0,
     'fastlio_last_time': 0.0, 'fastlio_msg_count': 0, 'fastlio_hz_timer': 0.0,
+    'fastlio_last_odom_time': 0.0, 'fastlio_dt': 0.0,
+    'slam_age': 999.0, 'slam_quality': 0, 'slam_status': 'LOST',
+    'slam_dropouts': 0, 'slam_pose_error': 0.0,
+    'slam_hz_history': [], 'slam_error_history': [],
     'ros2_active': False, 'ros2_init_time': 0.0, 'ros2_error': '',
+    # Real-time fused control state
+    'fused_alt': 0.0, 'fused_climb': 0.0, 'fused_conf': 0,
+    'fused_weights': {'lidar': 0.0, 'slam': 0.0, 'baro': 1.0},
+    'fused_source': 'BARO',
     # Livox Mid-360 ML Training Data Collection
     'livox_pc_frames': 0, 'livox_pc_last_pts': 0,  # Point cloud frame count and last point count
     'livox_imu_samples': 0,  # IMU sample count
@@ -157,12 +186,638 @@ state = {
     'rtl_active': False,  # Return-to-launch active
     'sensor_status_log': [],  # Track sensor health during flight
     'slam_last_warn_time': 0.0,  # Rate-limit SLAM warnings
+    # Archive fusion status
+    'archive_summary': {},
+    'session_study': {},
+    'archive_last_scan': 0.0,
+    'archive_last_error': '',
+    'ops_todo': [],
 }
 
 
 def low_pass(prev_value, new_value, alpha):
     """Simple first-order low-pass filter."""
     return (alpha * new_value) + ((1.0 - alpha) * prev_value)
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_lfs_pointer(file_path):
+    """Detect git-lfs pointer files so we can warn the operator clearly."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            first_line = f.readline().strip()
+            return first_line == LFS_POINTER_HEADER
+    except OSError:
+        return False
+
+
+def _read_lfs_declared_size(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("size "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _extract_session_id(file_name):
+    match = re.search(r"(\d{8}_\d{6})", file_name)
+    return match.group(1) if match else ""
+
+
+def _candidate_files(pattern, include_root_pattern=None):
+    files = []
+    files.extend(glob.glob(pattern))
+    if include_root_pattern:
+        files.extend(glob.glob(include_root_pattern))
+    unique_files = sorted(set(files), key=os.path.basename)
+    return unique_files
+
+
+def summarize_telemetry_file(file_path):
+    summary = {
+        'rows': 0,
+        'max_alt': 0.0,
+        'min_batt_v': 999.0,
+        'max_vib': 0.0,
+        'is_lfs': False,
+        'lfs_size': 0,
+    }
+
+    if _is_lfs_pointer(file_path):
+        summary['is_lfs'] = True
+        summary['lfs_size'] = _read_lfs_declared_size(file_path)
+        return summary
+
+    try:
+        with open(file_path, "r", newline="", encoding="utf-8", errors="ignore") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return summary
+            for row in reader:
+                summary['rows'] += 1
+
+                alt = _safe_float(
+                    row.get('Alt_m', row.get('Lidar_Alt_m', row.get('Baro_Alt_m', 0.0))),
+                    0.0
+                )
+                summary['max_alt'] = max(summary['max_alt'], alt)
+
+                batt = _safe_float(row.get('Batt_V', row.get('Batt_Voltage', 0.0)), 0.0)
+                if batt > 0.0:
+                    summary['min_batt_v'] = min(summary['min_batt_v'], batt)
+
+                vib_x = _safe_float(row.get('Vib_X', row.get('Vibration_X', 0.0)), 0.0)
+                vib_y = _safe_float(row.get('Vib_Y', row.get('Vibration_Y', 0.0)), 0.0)
+                vib_z = _safe_float(row.get('Vib_Z', row.get('Vibration_Z', 0.0)), 0.0)
+                summary['max_vib'] = max(summary['max_vib'], vib_x, vib_y, vib_z)
+
+        if summary['min_batt_v'] == 999.0:
+            summary['min_batt_v'] = 0.0
+    except OSError:
+        pass
+
+    return summary
+
+
+def summarize_event_file(file_path):
+    summary = {'lines': 0, 'warn': 0, 'critical': 0, 'is_lfs': False, 'lfs_size': 0}
+
+    if _is_lfs_pointer(file_path):
+        summary['is_lfs'] = True
+        summary['lfs_size'] = _read_lfs_declared_size(file_path)
+        return summary
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                summary['lines'] += 1
+                upper = stripped.upper()
+                if "CRITICAL" in upper or "ABORT" in upper or "FAIL" in upper:
+                    summary['critical'] += 1
+                elif "WARN" in upper:
+                    summary['warn'] += 1
+    except OSError:
+        pass
+
+    return summary
+
+
+def summarize_livox_imu_file(file_path):
+    summary = {'samples': 0, 'max_accel': 0.0, 'is_lfs': False, 'lfs_size': 0}
+
+    if _is_lfs_pointer(file_path):
+        summary['is_lfs'] = True
+        summary['lfs_size'] = _read_lfs_declared_size(file_path)
+        return summary
+
+    try:
+        with open(file_path, "r", newline="", encoding="utf-8", errors="ignore") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return summary
+            for row in reader:
+                ax = _safe_float(row.get('Accel_X', 0.0), 0.0)
+                ay = _safe_float(row.get('Accel_Y', 0.0), 0.0)
+                az = _safe_float(row.get('Accel_Z', 0.0), 0.0)
+                amag = math.sqrt(ax * ax + ay * ay + az * az)
+                summary['samples'] += 1
+                summary['max_accel'] = max(summary['max_accel'], amag)
+    except OSError:
+        pass
+
+    return summary
+
+
+def summarize_livox_pointcloud_file(file_path):
+    summary = {'frames': 0, 'points': 0, 'bytes': 0, 'is_lfs': False, 'lfs_size': 0}
+
+    if _is_lfs_pointer(file_path):
+        summary['is_lfs'] = True
+        summary['lfs_size'] = _read_lfs_declared_size(file_path)
+        return summary
+
+    try:
+        summary['bytes'] = os.path.getsize(file_path)
+        with open(file_path, "rb") as f:
+            if f.read(8) != b'LIVOXPC1':
+                return summary
+
+            file_size = summary['bytes']
+            while True:
+                hdr = f.read(14)
+                if len(hdr) < 14:
+                    break
+                _, point_num, point_step = struct.unpack('<dIH', hdr)
+
+                if point_step == 19:
+                    probe = f.read(8)
+                    if len(probe) < 8:
+                        break
+                    candidate_timebase = struct.unpack('<Q', probe)[0]
+                    if candidate_timebase < 1_000_000_000:
+                        f.seek(-8, os.SEEK_CUR)
+
+                payload_bytes = int(point_num) * int(point_step)
+                remaining = file_size - f.tell()
+                if payload_bytes < 0 or payload_bytes > remaining:
+                    break
+
+                f.seek(payload_bytes, os.SEEK_CUR)
+                summary['frames'] += 1
+                summary['points'] += int(point_num)
+    except OSError:
+        pass
+
+    return summary
+
+
+def collect_archive_summary():
+    telemetry_files = _candidate_files(
+        os.path.join(TELEMETRY_DIR, 'telemetry_*.csv'),
+        os.path.join(PROJECT_ROOT, 'telemetry_*.csv')
+    )
+    event_files = _candidate_files(
+        os.path.join(EVENTS_DIR, 'events_*.txt'),
+        os.path.join(PROJECT_ROOT, 'events_*.txt')
+    )
+    imu_files = _candidate_files(
+        os.path.join(LIVOX_DIR, 'livox_imu_*.csv'),
+        os.path.join(PROJECT_ROOT, 'livox_imu_*.csv')
+    )
+    pc_files = _candidate_files(
+        os.path.join(LIVOX_DIR, 'livox_pointcloud_*.bin'),
+        os.path.join(PROJECT_ROOT, 'livox_pointcloud_*.bin')
+    )
+
+    summary = {
+        'telemetry_files': len(telemetry_files),
+        'event_files': len(event_files),
+        'imu_files': len(imu_files),
+        'pc_files': len(pc_files),
+        'telemetry_rows_total': 0,
+        'event_lines_total': 0,
+        'event_warn_total': 0,
+        'event_critical_total': 0,
+        'imu_samples_total': 0,
+        'pc_frames_total': 0,
+        'pc_points_total': 0,
+        'max_alt_all': 0.0,
+        'max_vib_all': 0.0,
+        'min_batt_all': 999.0,
+        'max_imu_accel': 0.0,
+        'lfs_placeholders': 0,
+        'lfs_declared_bytes': 0,
+        'correlated_sessions': 0,
+        'latest_session': '',
+        'latest_correlated_session': '',
+    }
+
+    tele_sessions = set()
+    evt_sessions = set()
+    imu_sessions = set()
+    pc_sessions = set()
+
+    for fp in telemetry_files:
+        ts = summarize_telemetry_file(fp)
+        if ts['is_lfs']:
+            summary['lfs_placeholders'] += 1
+            summary['lfs_declared_bytes'] += ts['lfs_size']
+        else:
+            summary['telemetry_rows_total'] += ts['rows']
+            summary['max_alt_all'] = max(summary['max_alt_all'], ts['max_alt'])
+            summary['max_vib_all'] = max(summary['max_vib_all'], ts['max_vib'])
+            if ts['min_batt_v'] > 0.0:
+                summary['min_batt_all'] = min(summary['min_batt_all'], ts['min_batt_v'])
+        sid = _extract_session_id(os.path.basename(fp))
+        if sid:
+            tele_sessions.add(sid)
+
+    for fp in event_files:
+        es = summarize_event_file(fp)
+        if es['is_lfs']:
+            summary['lfs_placeholders'] += 1
+            summary['lfs_declared_bytes'] += es['lfs_size']
+        else:
+            summary['event_lines_total'] += es['lines']
+            summary['event_warn_total'] += es['warn']
+            summary['event_critical_total'] += es['critical']
+        sid = _extract_session_id(os.path.basename(fp))
+        if sid:
+            evt_sessions.add(sid)
+
+    for fp in imu_files:
+        ims = summarize_livox_imu_file(fp)
+        if ims['is_lfs']:
+            summary['lfs_placeholders'] += 1
+            summary['lfs_declared_bytes'] += ims['lfs_size']
+        else:
+            summary['imu_samples_total'] += ims['samples']
+            summary['max_imu_accel'] = max(summary['max_imu_accel'], ims['max_accel'])
+        sid = _extract_session_id(os.path.basename(fp))
+        if sid:
+            imu_sessions.add(sid)
+
+    for fp in pc_files:
+        pcs = summarize_livox_pointcloud_file(fp)
+        if pcs['is_lfs']:
+            summary['lfs_placeholders'] += 1
+            summary['lfs_declared_bytes'] += pcs['lfs_size']
+        else:
+            summary['pc_frames_total'] += pcs['frames']
+            summary['pc_points_total'] += pcs['points']
+        sid = _extract_session_id(os.path.basename(fp))
+        if sid:
+            pc_sessions.add(sid)
+
+    if summary['min_batt_all'] == 999.0:
+        summary['min_batt_all'] = 0.0
+
+    shared = tele_sessions & evt_sessions & imu_sessions & pc_sessions
+    summary['correlated_sessions'] = len(shared)
+    if shared:
+        summary['latest_correlated_session'] = sorted(shared)[-1]
+
+    all_sessions = sorted(tele_sessions | evt_sessions | imu_sessions | pc_sessions)
+    if all_sessions:
+        summary['latest_session'] = all_sessions[-1]
+
+    return summary
+
+
+def collect_session_bundle(session_id):
+    """Collect file paths for a specific session id across all sources."""
+    if not session_id:
+        return {}
+
+    return {
+        'telemetry': _candidate_files(
+            os.path.join(TELEMETRY_DIR, f'telemetry_{session_id}.csv'),
+            os.path.join(PROJECT_ROOT, f'telemetry_{session_id}.csv')
+        ),
+        'events': _candidate_files(
+            os.path.join(EVENTS_DIR, f'events_{session_id}.txt'),
+            os.path.join(PROJECT_ROOT, f'events_{session_id}.txt')
+        ),
+        'imu': _candidate_files(
+            os.path.join(LIVOX_DIR, f'livox_imu_{session_id}.csv'),
+            os.path.join(PROJECT_ROOT, f'livox_imu_{session_id}.csv')
+        ),
+        'pointcloud': _candidate_files(
+            os.path.join(LIVOX_DIR, f'livox_pointcloud_{session_id}.bin'),
+            os.path.join(PROJECT_ROOT, f'livox_pointcloud_{session_id}.bin')
+        )
+    }
+
+
+def summarize_latest_session(session_id):
+    """Build a compact study summary for the latest correlated session."""
+    study = {
+        'session_id': session_id,
+        'duration_s': 0.0,
+        'rows': 0,
+        'event_lines': 0,
+        'event_warn': 0,
+        'event_critical': 0,
+        'imu_samples': 0,
+        'imu_peak_accel': 0.0,
+        'pc_frames': 0,
+        'pc_points': 0,
+        'max_alt': 0.0,
+        'min_batt_v': 0.0,
+        'max_vib': 0.0,
+        'avg_flow_qual': 0.0,
+        'avg_fastlio_hz': 0.0,
+        'flight_mode_last': 'N/A',
+    }
+
+    bundle = collect_session_bundle(session_id)
+    tele = bundle.get('telemetry', [])
+    evt = bundle.get('events', [])
+    imu = bundle.get('imu', [])
+    pc = bundle.get('pointcloud', [])
+
+    if tele:
+        fp = tele[-1]
+        ts = summarize_telemetry_file(fp)
+        study['rows'] = ts.get('rows', 0)
+        study['max_alt'] = ts.get('max_alt', 0.0)
+        study['min_batt_v'] = ts.get('min_batt_v', 0.0)
+        study['max_vib'] = ts.get('max_vib', 0.0)
+
+        if not ts.get('is_lfs', False):
+            first_secs = None
+            last_secs = None
+            flow_sum = 0.0
+            flow_count = 0
+            hz_sum = 0.0
+            hz_count = 0
+            last_mode = 'N/A'
+            try:
+                with open(fp, 'r', newline='', encoding='utf-8', errors='ignore') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        ts_text = row.get('Timestamp', '')
+                        try:
+                            t = datetime.strptime(ts_text, "%H:%M:%S.%f")
+                            sec = t.hour * 3600.0 + t.minute * 60.0 + t.second + t.microsecond / 1e6
+                            if first_secs is None:
+                                first_secs = sec
+                            last_secs = sec
+                        except (ValueError, TypeError):
+                            pass
+
+                        fq = _safe_float(row.get('OptFlow_Qual', 0.0), 0.0)
+                        flow_sum += fq
+                        flow_count += 1
+
+                        hz = _safe_float(row.get('FastLIO_Hz', 0.0), 0.0)
+                        hz_sum += hz
+                        hz_count += 1
+
+                        mode = row.get('Flight_Mode', '').strip()
+                        if mode:
+                            last_mode = mode
+
+                if first_secs is not None and last_secs is not None:
+                    if last_secs >= first_secs:
+                        study['duration_s'] = round(last_secs - first_secs, 1)
+                    else:
+                        study['duration_s'] = 0.0
+                if flow_count > 0:
+                    study['avg_flow_qual'] = round(flow_sum / flow_count, 1)
+                if hz_count > 0:
+                    study['avg_fastlio_hz'] = round(hz_sum / hz_count, 1)
+                study['flight_mode_last'] = last_mode
+            except OSError:
+                pass
+
+    if evt:
+        es = summarize_event_file(evt[-1])
+        study['event_lines'] = es.get('lines', 0)
+        study['event_warn'] = es.get('warn', 0)
+        study['event_critical'] = es.get('critical', 0)
+
+    if imu:
+        ims = summarize_livox_imu_file(imu[-1])
+        study['imu_samples'] = ims.get('samples', 0)
+        study['imu_peak_accel'] = ims.get('max_accel', 0.0)
+
+    if pc:
+        pcs = summarize_livox_pointcloud_file(pc[-1])
+        study['pc_frames'] = pcs.get('frames', 0)
+        study['pc_points'] = pcs.get('points', 0)
+
+    return study
+
+
+def collect_correlated_session_ids():
+    """Return sorted session ids that have telemetry + events + Livox IMU + pointcloud."""
+    tele = {
+        _extract_session_id(os.path.basename(fp))
+        for fp in _candidate_files(
+            os.path.join(TELEMETRY_DIR, 'telemetry_*.csv'),
+            os.path.join(PROJECT_ROOT, 'telemetry_*.csv')
+        )
+    }
+    evt = {
+        _extract_session_id(os.path.basename(fp))
+        for fp in _candidate_files(
+            os.path.join(EVENTS_DIR, 'events_*.txt'),
+            os.path.join(PROJECT_ROOT, 'events_*.txt')
+        )
+    }
+    imu = {
+        _extract_session_id(os.path.basename(fp))
+        for fp in _candidate_files(
+            os.path.join(LIVOX_DIR, 'livox_imu_*.csv'),
+            os.path.join(PROJECT_ROOT, 'livox_imu_*.csv')
+        )
+    }
+    pc = {
+        _extract_session_id(os.path.basename(fp))
+        for fp in _candidate_files(
+            os.path.join(LIVOX_DIR, 'livox_pointcloud_*.bin'),
+            os.path.join(PROJECT_ROOT, 'livox_pointcloud_*.bin')
+        )
+    }
+
+    shared = (tele & evt & imu & pc)
+    shared.discard('')
+    return sorted(shared)
+
+
+def read_event_tail(session_id, max_lines=6):
+    """Read final significant lines for a session event file."""
+    bundle = collect_session_bundle(session_id)
+    event_files = bundle.get('events', [])
+    if not event_files:
+        return []
+
+    fp = event_files[-1]
+    if _is_lfs_pointer(fp):
+        return ["Event file is still an LFS pointer"]
+
+    lines = []
+    try:
+        with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    lines.append(s)
+    except OSError:
+        return ["Failed to read event file"]
+
+    return lines[-max_lines:]
+
+
+def build_session_sparklines(session_id):
+    """Create compact trend sparklines for a session telemetry file."""
+    out = {
+        'alt': "n/a",
+        'batt': "n/a",
+        'vib': "n/a",
+        'flow': "n/a",
+        'slam_hz': "n/a",
+    }
+
+    bundle = collect_session_bundle(session_id)
+    tele = bundle.get('telemetry', [])
+    if not tele:
+        return out
+
+    fp = tele[-1]
+    if _is_lfs_pointer(fp):
+        return out
+
+    alt_hist = []
+    batt_hist = []
+    vib_hist = []
+    flow_hist = []
+    slam_hz_hist = []
+
+    try:
+        with open(fp, 'r', newline='', encoding='utf-8', errors='ignore') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                alt_hist.append(_safe_float(row.get('Lidar_Alt_m', row.get('Alt_m', 0.0)), 0.0))
+                batt_hist.append(_safe_float(row.get('Batt_V', 0.0), 0.0))
+
+                vx = _safe_float(row.get('Vib_X', 0.0), 0.0)
+                vy = _safe_float(row.get('Vib_Y', 0.0), 0.0)
+                vz = _safe_float(row.get('Vib_Z', 0.0), 0.0)
+                vib_hist.append(max(vx, vy, vz))
+
+                fq = _safe_float(row.get('OptFlow_Qual', 0.0), 0.0)
+                flow_hist.append(fq)
+
+                slam_hz_hist.append(_safe_float(row.get('FastLIO_Hz', 0.0), 0.0))
+    except OSError:
+        return out
+
+    if alt_hist:
+        out['alt'] = create_sparkline(alt_hist[-80:], width=24)
+    if batt_hist:
+        out['batt'] = create_sparkline(batt_hist[-80:], width=24)
+    if vib_hist:
+        out['vib'] = create_sparkline(vib_hist[-80:], width=24)
+    if flow_hist:
+        out['flow'] = create_sparkline(flow_hist[-80:], width=24)
+    if slam_hz_hist:
+        out['slam_hz'] = create_sparkline(slam_hz_hist[-80:], width=24)
+
+    return out
+
+
+def build_ops_todo(summary):
+    todos = []
+
+    if summary.get('lfs_placeholders', 0) > 0:
+        todos.append("Fetch Git LFS data to unlock archived telemetry/events/Livox logs")
+
+    if summary.get('correlated_sessions', 0) == 0:
+        todos.append("Record one full session containing telemetry + events + Livox + IMU")
+
+    if summary.get('event_critical_total', 0) > 0:
+        todos.append(f"Review {summary['event_critical_total']} critical/abort events in event logs")
+
+    if summary.get('max_vib_all', 0.0) > MAX_GROUND_VIBE:
+        todos.append(f"Investigate high vibration archive peaks ({summary['max_vib_all']:.1f} m/s^2)")
+
+    if summary.get('min_batt_all', 99.0) > 0.0 and summary.get('min_batt_all', 99.0) < MIN_SAFE_VOLTAGE:
+        todos.append(f"Archive shows low-voltage floor {summary['min_batt_all']:.2f}V; retune power budget")
+
+    if summary.get('imu_samples_total', 0) == 0:
+        todos.append("Verify /livox/imu stream and IMU CSV logging")
+
+    if state['ros2_active'] and state.get('slam_quality', 0) < 50:
+        todos.append(
+            f"SLAM quality low ({state.get('slam_quality', 0)}%). Check /Odometry and /cloud_registered health"
+        )
+
+    if state['ros2_active'] and state.get('slam_dropouts', 0) > 20:
+        todos.append("Reduce SLAM dropouts: check ROS2 CPU load/QoS/network timing")
+
+    if state['flow_qual'] < MIN_PREFLIGHT_FLOW_QUAL:
+        todos.append(f"Improve optical-flow quality to >={MIN_PREFLIGHT_FLOW_QUAL} before AUTO TAKEOFF")
+
+    if not state['rangefinder_healthy']:
+        todos.append("Rangefinder unhealthy; fix lidar/range stream before autonomy")
+
+    if not todos:
+        todos.append("No high-priority blockers detected")
+
+    return todos[:6]
+
+
+def refresh_archive_summary(force=False):
+    now = time.time()
+    if not force and (now - state['archive_last_scan'] < ARCHIVE_REFRESH_SEC):
+        return
+
+    try:
+        summary = collect_archive_summary()
+        state['archive_summary'] = summary
+        latest_corr = summary.get('latest_correlated_session', '')
+        state['session_study'] = summarize_latest_session(latest_corr) if latest_corr else {}
+        state['ops_todo'] = build_ops_todo(summary)
+        state['archive_last_error'] = ''
+    except Exception as e:
+        state['archive_last_error'] = str(e)[:120]
+    finally:
+        state['archive_last_scan'] = now
+
+
+def export_ops_todo():
+    """Save a focused TODO snapshot for offline follow-up."""
+    out_path = f"ops_todo_{session_id}.txt"
+    summary = state.get('archive_summary', {})
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("ASCEND Ops TODO Snapshot\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Session: {session_id}\n\n")
+        f.write("Archive Summary\n")
+        f.write(f"- Telemetry files: {summary.get('telemetry_files', 0)}\n")
+        f.write(f"- Event files: {summary.get('event_files', 0)}\n")
+        f.write(f"- Livox IMU files: {summary.get('imu_files', 0)}\n")
+        f.write(f"- Livox PC files: {summary.get('pc_files', 0)}\n")
+        f.write(f"- Correlated sessions: {summary.get('correlated_sessions', 0)}\n")
+        f.write(f"- LFS placeholders: {summary.get('lfs_placeholders', 0)}\n\n")
+        f.write("TODO\n")
+        for idx, item in enumerate(state.get('ops_todo', []), start=1):
+            f.write(f"{idx}. {item}\n")
+    return out_path
 
 def update_log(msg):
     """Updates the UI event log and the black-box event file simultaneously."""
@@ -299,6 +954,96 @@ def get_best_altitude_for_control():
         return state['lidar_alt']
     # Fall back to barometer
     return state['alt']
+
+
+def get_fused_altitude_for_control():
+    """Weighted fusion of lidar, SLAM, and baro altitude for robust supervision."""
+    now = time.time()
+    lidar_ok = state['rangefinder_healthy'] and state['lidar_alt'] > 0
+    slam_ok = (
+        state['fastlio_healthy']
+        and state.get('slam_quality', 0) >= 40
+        and state.get('slam_age', 999.0) < FASTLIO_TIMEOUT
+    )
+    baro_ok = state['alt'] != 0.0
+
+    w_lidar = 0.0
+    w_slam = 0.0
+    w_baro = 0.0
+
+    if lidar_ok:
+        lidar_age = now - state.get('lidar_last_update', 0.0) if state.get('lidar_last_update', 0.0) > 0 else 999.0
+        lidar_fresh = 1.0 if lidar_age < 0.3 else 0.6 if lidar_age < 0.7 else 0.2
+        w_lidar = 0.65 * lidar_fresh
+
+    if slam_ok:
+        w_slam = 0.25 * (state.get('slam_quality', 0) / 100.0)
+
+    if baro_ok:
+        w_baro = 0.10
+
+    # Barometer can drift heavily near ground test benches; downweight hard outliers.
+    if lidar_ok and baro_ok and abs(state['lidar_alt'] - state['alt']) > 3.0:
+        w_baro *= 0.05
+
+    # Reduce trust on sensors that disagree heavily.
+    if lidar_ok and slam_ok:
+        disagreement = abs(state['lidar_alt'] - state['fastlio_z'])
+        if disagreement > MAX_ALT_SENSOR_DISAGREE:
+            if state.get('slam_quality', 0) >= 70:
+                w_lidar *= 0.5
+            else:
+                w_slam *= 0.4
+        if disagreement > 2.0:
+            # Extreme mismatch: keep SLAM as secondary guard rail, not primary altitude source.
+            w_slam *= 0.3
+
+    total = w_lidar + w_slam + w_baro
+    if total <= 1e-6:
+        fused = get_best_altitude_for_control()
+        state['fused_weights'] = {'lidar': 0.0, 'slam': 0.0, 'baro': 1.0}
+        state['fused_conf'] = 20
+        state['fused_source'] = 'BARO'
+    else:
+        wl = w_lidar / total
+        ws = w_slam / total
+        wb = w_baro / total
+        fused = (
+            wl * state['lidar_alt'] +
+            ws * state['fastlio_z'] +
+            wb * state['alt']
+        )
+        state['fused_weights'] = {'lidar': round(wl, 3), 'slam': round(ws, 3), 'baro': round(wb, 3)}
+        state['fused_conf'] = int(min(100, (wl * 100) + (ws * state.get('slam_quality', 0)) + (wb * 50)))
+
+        if wl >= ws and wl >= wb:
+            state['fused_source'] = 'LIDAR'
+        elif ws >= wb:
+            state['fused_source'] = 'SLAM'
+        else:
+            state['fused_source'] = 'BARO'
+
+    # Blend for smoother control handoff.
+    prev = state.get('fused_alt', 0.0)
+    if prev <= 0.0:
+        state['fused_alt'] = round(fused, 3)
+    else:
+        state['fused_alt'] = round(low_pass(prev, fused, 0.45), 3)
+
+    return state['fused_alt']
+
+
+def get_fused_climb_rate():
+    """Fuse FC climb with fused-altitude slope for smoother vertical decisions."""
+    if len(state['alt_history']) >= 8:
+        slope = get_altitude_slope()
+    else:
+        slope = state.get('climb', 0.0)
+
+    # Blend MAVLink climb and estimator slope.
+    fused_climb = (0.6 * state.get('climb', 0.0)) + (0.4 * slope)
+    state['fused_climb'] = round(fused_climb, 3)
+    return state['fused_climb']
 
 
 def trigger_rtl(master):
@@ -464,6 +1209,13 @@ if ROS2_AVAILABLE:
                 state['fastlio_yaw'] = round(yaw, 1)
 
                 # Health tracking
+                prev_odom_time = state['fastlio_last_odom_time']
+                if prev_odom_time > 0:
+                    dt = now - prev_odom_time
+                    state['fastlio_dt'] = dt
+                    if dt > 0.35:
+                        state['slam_dropouts'] += 1
+                state['fastlio_last_odom_time'] = now
                 state['fastlio_last_time'] = now
                 state['fastlio_healthy'] = True
 
@@ -640,9 +1392,80 @@ def check_fastlio_health():
     """Update FAST-LIO health status based on message freshness."""
     if state['fastlio_last_time'] > 0:
         age = time.time() - state['fastlio_last_time']
+        state['slam_age'] = age
         state['fastlio_healthy'] = age < FASTLIO_TIMEOUT
     else:
+        state['slam_age'] = 999.0
         state['fastlio_healthy'] = False
+
+
+def update_slam_metrics():
+    """Compute SLAM quality/status metrics for robust operator visibility."""
+    now = time.time()
+    age = now - state['fastlio_last_time'] if state['fastlio_last_time'] > 0 else 999.0
+    state['slam_age'] = age
+
+    hz = float(state.get('fastlio_hz', 0.0))
+    state['slam_hz_history'].append(hz)
+    if len(state['slam_hz_history']) > 60:
+        state['slam_hz_history'].pop(0)
+
+    if state['rangefinder_healthy']:
+        pose_error = abs(state['fastlio_z'] - state['lidar_alt'])
+    else:
+        pose_error = 0.0
+    state['slam_pose_error'] = pose_error
+
+    state['slam_error_history'].append(pose_error)
+    if len(state['slam_error_history']) > 60:
+        state['slam_error_history'].pop(0)
+
+    quality = 0
+    if state['ros2_active']:
+        quality += 10
+
+    if age < FASTLIO_TIMEOUT:
+        quality += 30
+
+    if hz >= FASTLIO_MIN_HEALTHY_HZ:
+        quality += 20
+    elif hz > 0:
+        quality += int((hz / FASTLIO_MIN_HEALTHY_HZ) * 20)
+
+    points = max(int(state.get('fastlio_points', 0)), int(state.get('livox_pc_last_pts', 0)))
+    if points > 0:
+        quality += min(20, int(points / 1500))
+
+    if state['rangefinder_healthy']:
+        if pose_error < 0.25:
+            quality += 20
+        elif pose_error < SLAM_MAX_ALT_DIFF:
+            quality += 10
+        else:
+            quality -= 20
+
+    if age > FASTLIO_STALE_WARN_SEC:
+        quality -= 15
+
+    if state.get('slam_dropouts', 0) > 10:
+        quality -= 10
+
+    quality = max(0, min(100, int(quality)))
+    state['slam_quality'] = quality
+
+    if not state['ros2_active'] or age >= FASTLIO_TIMEOUT:
+        state['slam_status'] = 'LOST'
+    elif quality >= 75:
+        state['slam_status'] = 'GOOD'
+    elif quality >= 45:
+        state['slam_status'] = 'DEGRADED'
+    else:
+        state['slam_status'] = 'WEAK'
+
+    if state['armed'] and age > FASTLIO_STALE_WARN_SEC:
+        if now - state['slam_last_warn_time'] > SLAM_WARN_INTERVAL:
+            update_log(f"⚠ WARNING: SLAM stale ({age:.1f}s)")
+            state['slam_last_warn_time'] = now
 
 
 # --- TELEMETRY METRICS & TRENDING ---
@@ -666,7 +1489,9 @@ def update_telemetry_metrics():
         state['climb_history'].pop(0)
     
     # Altitude trend
-    current_best_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    current_best_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
+        state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    )
     state['alt_history'].append(current_best_alt)
     if len(state['alt_history']) > max_history:
         state['alt_history'].pop(0)
@@ -805,18 +1630,7 @@ def get_sensor_confidence(sensor_name):
             confidence = 30
     
     elif sensor_name == "SLAM":
-        if state['fastlio_healthy']:
-            age = time.time() - state['fastlio_last_time']
-            if age < 0.5:
-                confidence = 90
-            elif age < 1.0:
-                confidence = 70
-            elif age < 2.0:
-                confidence = 40
-            else:
-                confidence = 0
-        else:
-            confidence = 0
+        confidence = int(state.get('slam_quality', 0))
     
     elif sensor_name == "OPTFLOW":
         if state['flow_qual'] > 150:
@@ -903,8 +1717,8 @@ def run_preflight_diagnostics():
         )
         return False
 
-    if not state['rangefinder_healthy']:
-        update_log("DIAG: FAIL - Rangefinder unavailable. Autonomous takeoff blocked.")
+    if not state['rangefinder_healthy'] and state.get('slam_quality', 0) < 55:
+        update_log("DIAG: FAIL - Rangefinder unavailable and SLAM weak. Autonomous takeoff blocked.")
         return False
 
     # FAST-LIO health check
@@ -917,7 +1731,11 @@ def run_preflight_diagnostics():
     else:
         update_log("DIAG: INFO - ROS2 not active. Livox ML logging unavailable.")
 
-    update_log("DIAG: Control source = Rangefinder + Optical Flow (FAST-LIO disabled for control)")
+    fused_alt = get_fused_altitude_for_control()
+    update_log(
+        "DIAG: Control fusion active "
+        f"(src={state.get('fused_source', 'N/A')}, conf={state.get('fused_conf', 0)}%, alt={fused_alt:.2f}m)"
+    )
         
     update_log("DIAG: PASS - Systems nominal. Ready for flight.")
     return True
@@ -980,7 +1798,9 @@ def auto_takeoff_sequence(master, target_alt=None):
         time.sleep(0.1)
 
     # 3. Capture ground altitude reference
-    ground_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    ground_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
+        state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    )
     abs_target = ground_alt + target_alt
     update_log(f"AUTO: Ground: {ground_alt:.2f}m. Target: {abs_target:.2f}m ({target_alt:.0f}m AGL)")
 
@@ -1074,16 +1894,27 @@ def auto_takeoff_sequence(master, target_alt=None):
     no_climb_since = None
     
     while time.time() - climb_start < CLIMB_TIMEOUT and state['armed']:
-        current_alt = get_best_altitude_for_control()
+        current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else get_best_altitude_for_control()
+        fused_climb = get_fused_climb_rate()
         alt_remaining = abs_target - current_alt
         
         # Staged throttle: reduce as we approach target and damp with climb-rate feedback.
         if alt_remaining < 0.10:
-            state['rc_throttle'] = 1520
+            state['rc_throttle'] = 1515
         elif alt_remaining < 0.30:
-            state['rc_throttle'] = 1560 if state['climb'] < 0.25 else 1535
+            state['rc_throttle'] = 1560 if fused_climb < 0.22 else 1530
         else:
-            state['rc_throttle'] = 1680 if state['climb'] < 0.15 else 1620
+            state['rc_throttle'] = 1680 if fused_climb < 0.15 else 1620
+
+        # Dynamic confidence adjustment: if fused confidence is low, avoid aggressive climb.
+        if state.get('fused_conf', 0) < 45:
+            state['rc_throttle'] = min(state['rc_throttle'], 1600)
+
+        # Livox obstacle gate during ascent.
+        if state['livox_obs'] > 0 and state['livox_obs'] < LIVOX_MIN_SAFE_DIST:
+            update_log(f"AUTO: ABORT! Livox obstacle {state['livox_obs']:.2f}m during takeoff")
+            auto_land_sequence(master)
+            return
         
         state['rc_pitch'] = 1500
         state['rc_roll'] = 1500
@@ -1096,13 +1927,13 @@ def auto_takeoff_sequence(master, target_alt=None):
             break
 
         # Abort if FC is not responding to climb command despite enough margin.
-        if alt_remaining > 0.25 and state['climb'] < MIN_TAKEOFF_CLIMB_RATE:
+        if alt_remaining > 0.25 and fused_climb < MIN_TAKEOFF_CLIMB_RATE:
             if no_climb_since is None:
                 no_climb_since = time.time()
             elif time.time() - no_climb_since > NO_CLIMB_ABORT_SEC:
                 update_log(
                     f"AUTO: ABORT! No climb response for {NO_CLIMB_ABORT_SEC:.1f}s "
-                    f"(climb={state['climb']:.2f}m/s)."
+                    f"(climb={fused_climb:.2f}m/s)."
                 )
                 emergency_disarm(master)
                 return
@@ -1113,7 +1944,7 @@ def auto_takeoff_sequence(master, target_alt=None):
         if time.time() - last_alt_log > 1.0:
             update_log(
                 f"AUTO: Climbing... {current_alt:.2f}m / {abs_target:.2f}m "
-                f"(remaining: {alt_remaining:.2f}m, climb: {state['climb']:.2f}m/s)"
+                f"(remaining: {alt_remaining:.2f}m, climb: {fused_climb:.2f}m/s, conf:{state.get('fused_conf', 0)}%)"
             )
             last_alt_log = time.time()
         
@@ -1131,7 +1962,9 @@ def auto_takeoff_sequence(master, target_alt=None):
             return
     else:
         # Loop ended via timeout (while condition became false)
-        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
+            state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        )
         update_log(f"AUTO: Climb timeout at {current_alt:.2f}m. Proceeding to hover.")
 
     if not state['armed']:
@@ -1186,12 +2019,18 @@ def auto_takeoff_sequence(master, target_alt=None):
     LOG_INTERVAL = 2.0
     
     while time.time() - hover_start < total_hover_time and state['armed'] and state['macro_status'] == 'HOVER':
-        current_alt = state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
+            state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+        )
         
         # ALL STICKS NEUTRAL - FC handles everything in LOITER
         # In LOITER: pitch/roll 1500 = hold position (FC uses optical flow)
         # In ALT_HOLD: pitch/roll 1500 = level (no position hold)
         state['rc_throttle'] = HOVER_THR  # 1500
+        # Mild correction in LOITER if fused altitude drifts too much.
+        alt_err = abs_target - current_alt
+        if abs(alt_err) > 0.15:
+            state['rc_throttle'] = 1500 + max(-20, min(20, int(alt_err * 60)))
         state['rc_pitch'] = 1500
         state['rc_roll'] = 1500
         state['rc_yaw'] = 1500
@@ -1222,6 +2061,11 @@ def auto_takeoff_sequence(master, target_alt=None):
                 return
         else:
             poor_flow_since = None
+
+        if state['livox_obs'] > 0 and state['livox_obs'] < 0.6:
+            update_log(f"AUTO: Livox obstacle {state['livox_obs']:.2f}m during hover. Landing.")
+            auto_land_sequence(master)
+            return
         
         time.sleep(0.05)
         
@@ -1277,7 +2121,7 @@ def auto_land_sequence(master):
         update_log("LAND: Not armed. Nothing to do.")
         return
     
-    current_check_alt = get_best_altitude_for_control()
+    current_check_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else get_best_altitude_for_control()
     if current_check_alt < 0.10:
         update_log("LAND: Already on ground. Disarming.")
         emergency_disarm(master)
@@ -1317,7 +2161,7 @@ def auto_land_sequence(master):
             update_log("LAND: Aborted — KILL switch or mode change.")
             return
         
-        current_alt = get_best_altitude_for_control()
+        current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else get_best_altitude_for_control()
         
         # TILT SAFETY: if drone tilts > 30° during landing, emergency disarm
         if abs(state['roll']) > 30 or abs(state['pitch']) > 30:
@@ -1334,7 +2178,10 @@ def auto_land_sequence(master):
         
         # Periodic logging
         if time.time() - last_log_time > 2.0:
-            update_log(f"LAND: Alt={current_alt:.2f}m Mode={state['mode']} Climb={state['climb']:.2f}")
+            update_log(
+                f"LAND: Alt={current_alt:.2f}m Mode={state['mode']} "
+                f"Climb={get_fused_climb_rate():.2f} Conf={state.get('fused_conf', 0)}%"
+            )
             last_log_time = time.time()
         
         time.sleep(0.05)
@@ -1535,6 +2382,7 @@ def mavlink_loop(master):
             state['alt'] = round(msg.relative_alt / 1000.0, 2)
             # Check FAST-LIO health on each telemetry cycle
             check_fastlio_health()
+            update_slam_metrics()
             update_telemetry_metrics()  # Update trending metrics
             csv_writer.writerow([
                 datetime.now().strftime("%H:%M:%S.%f"),
@@ -1608,6 +2456,8 @@ def draw_dashboard(stdscr, master):
     curses.init_pair(6, curses.COLOR_WHITE,  -1)   # Dim/neutral info
     curses.init_pair(7, curses.COLOR_BLUE,   -1)   # Alternate highlight
 
+    refresh_archive_summary(force=True)
+
     while True:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
@@ -1634,6 +2484,7 @@ def draw_dashboard(stdscr, master):
         mid = "─" * W
 
         row = 0
+        refresh_archive_summary(force=False)
         
         # ============ HEADER ============
         safe_add(row, 0, sep, c_info)
@@ -1675,9 +2526,72 @@ def draw_dashboard(stdscr, master):
         best_alt, alt_source, alt_conf = get_best_altitude_estimate()
         remaining_time = get_battery_time_remaining()
         
-        status_bar = f"MODE:{state['mode']:<12} | PHASE:{state['macro_status']:<8} | EST:{alt_source}({alt_conf:3d}%) | TIME:{remaining_time:5.1f}min | LINK:{estimate_link_quality():3d}%"
+        status_bar = (
+            f"MODE:{state['mode']:<12} | PHASE:{state['macro_status']:<8} | "
+            f"SLAM:{state['slam_status']:<8}({state['slam_quality']:3d}%) | "
+            f"EST:{alt_source}({alt_conf:3d}%) | FUSE:{state.get('fused_conf', 0):3d}% | "
+            f"TIME:{remaining_time:5.1f}min | LINK:{estimate_link_quality():3d}%"
+        )
         safe_add(row, 2, status_bar, c_info)
         row += 1
+
+        # ============ ARCHIVE DATA FUSION ==========
+        archive = state.get('archive_summary', {})
+        if archive:
+            safe_add(row, 0, mid, c_info)
+            row += 1
+            archive_line = (
+                f"ARCHIVE: TLM {archive.get('telemetry_files', 0):3d} | EVT {archive.get('event_files', 0):3d} "
+                f"| IMU {archive.get('imu_files', 0):3d} | PC {archive.get('pc_files', 0):3d} "
+                f"| MATCHED {archive.get('correlated_sessions', 0):3d}"
+            )
+            safe_add(row, 2, archive_line, c_info)
+            row += 1
+
+            aggregate_line = (
+                f"TOTALS: rows {archive.get('telemetry_rows_total', 0):7d} | events {archive.get('event_lines_total', 0):6d} "
+                f"| imu {archive.get('imu_samples_total', 0):8d} | pc_frames {archive.get('pc_frames_total', 0):6d}"
+            )
+            safe_add(row, 2, aggregate_line, c_neu)
+            row += 1
+
+            quality_line = (
+                f"PEAKS: max_alt {archive.get('max_alt_all', 0.0):6.2f}m | max_vib {archive.get('max_vib_all', 0.0):6.2f} "
+                f"| min_batt {archive.get('min_batt_all', 0.0):5.2f}V | imu_accel {archive.get('max_imu_accel', 0.0):6.2f}"
+            )
+            safe_add(row, 2, quality_line, c_neu)
+            row += 1
+
+            lfs_count = archive.get('lfs_placeholders', 0)
+            lfs_line = f"LATEST: {archive.get('latest_session', 'n/a')} | LFS placeholders: {lfs_count}"
+            safe_add(row, 2, lfs_line, c_warn if lfs_count else c_ok)
+            row += 1
+
+            study = state.get('session_study', {})
+            if study:
+                study_line1 = (
+                    f"STUDY: session {study.get('session_id', 'n/a')} | dur {study.get('duration_s', 0.0):6.1f}s | "
+                    f"rows {study.get('rows', 0):6d} | mode {study.get('flight_mode_last', 'N/A'):<12}"
+                )
+                safe_add(row, 2, study_line1, c_info)
+                row += 1
+
+                study_line2 = (
+                    f"       EVT w/c {study.get('event_warn', 0):3d}/{study.get('event_critical', 0):3d} | "
+                    f"IMU {study.get('imu_samples', 0):7d} pk {study.get('imu_peak_accel', 0.0):5.2f} | "
+                    f"PC {study.get('pc_frames', 0):5d}/{study.get('pc_points', 0):8d} | "
+                    f"FlowQ {study.get('avg_flow_qual', 0.0):5.1f} | SLAMHz {study.get('avg_fastlio_hz', 0.0):5.1f}"
+                )
+                safe_add(row, 2, study_line2, c_neu)
+                row += 1
+
+            if state.get('archive_last_error'):
+                safe_add(row, 2, f"ARCHIVE ERROR: {state['archive_last_error']}", c_crit)
+                row += 1
+
+            for idx, todo_text in enumerate(state.get('ops_todo', [])[:3], start=1):
+                safe_add(row, 2, f"TODO {idx}: {todo_text}", c_warn)
+                row += 1
 
         # ============ PRIMARY FLIGHT INSTRUMENTS ============
         safe_add(row, 0, mid, c_info)
@@ -1686,7 +2600,13 @@ def draw_dashboard(stdscr, master):
         
         # Altitude readout with all estimates
         alt_color = c_ok if abs(state['lidar_alt'] - state['alt']) < 0.3 else c_warn
-        alt_line = f"ALT: {best_alt:7.2f}m [{alt_source}]  LIDAR:{state['lidar_alt']:6.2f}m  BARO:{state['alt']:6.2f}m  SLAM:{state['fastlio_z']:6.2f}m  Δ:{abs(state['lidar_alt']-state['alt']):6.3f}m"
+        fused_alt = state.get('fused_alt', best_alt)
+        fw = state.get('fused_weights', {'lidar': 0.0, 'slam': 0.0, 'baro': 1.0})
+        alt_line = (
+            f"ALT: {best_alt:7.2f}m [{alt_source}] FUSED:{fused_alt:6.2f}m({state.get('fused_source', '?')}) "
+            f"L/S/B:{fw.get('lidar', 0.0):.2f}/{fw.get('slam', 0.0):.2f}/{fw.get('baro', 0.0):.2f} "
+            f"ΔLB:{abs(state['lidar_alt']-state['alt']):6.3f}m"
+        )
         safe_add(row, 2, alt_line, alt_color)
         row += 1
         
@@ -1709,13 +2629,22 @@ def draw_dashboard(stdscr, master):
         
         slam_conf = get_sensor_confidence("SLAM")
         slam_status = get_sensor_health_char(state['fastlio_healthy'])
-        slam_line1 = f"SLAM: {slam_status} {state['fastlio_hz']:.0f}Hz  Pos{format_position_compact(state['fastlio_x'], state['fastlio_y'], state['fastlio_z'])}  Conf:{slam_conf:3d}%  Pts:{state['fastlio_points']:6d}"
-        slam_color = c_ok if slam_conf > 50 else c_warn if slam_conf > 0 else c_neu
+        slam_line1 = (
+            f"SLAM: {slam_status} {state['fastlio_hz']:.0f}Hz {state['slam_status']:<8} "
+            f"Pos{format_position_compact(state['fastlio_x'], state['fastlio_y'], state['fastlio_z'])} "
+            f"Q:{slam_conf:3d}%  Pts:{state['fastlio_points']:6d}"
+        )
+        slam_color = c_ok if state['slam_status'] == 'GOOD' else c_warn if slam_conf > 0 else c_neu
         safe_add(row, 2, slam_line1, slam_color)
         row += 1
         
         slam_vel_mag = math.sqrt(state['fastlio_vx']**2 + state['fastlio_vy']**2 + state['fastlio_vz']**2)
-        slam_line2 = f"      Vel{format_position_compact(state['fastlio_vx'], state['fastlio_vy'], state['fastlio_vz'])} (mag:{slam_vel_mag:6.3f}m/s)  Ori: R{state['fastlio_roll']:+6.1f}° P{state['fastlio_pitch']:+6.1f}° Y{state['fastlio_yaw']:+6.1f}°"
+        slam_err_spark = create_sparkline(state['slam_error_history'][-10:], width=8)
+        slam_line2 = (
+            f"      Vel{format_position_compact(state['fastlio_vx'], state['fastlio_vy'], state['fastlio_vz'])} "
+            f"(mag:{slam_vel_mag:6.3f}m/s)  Age:{state['slam_age']:4.1f}s  Δz:{state['slam_pose_error']:5.2f}m "
+            f"Drop:{state['slam_dropouts']:3d} [{slam_err_spark}]"
+        )
         safe_add(row, 2, slam_line2, slam_color)
         row += 1
 
@@ -1811,7 +2740,7 @@ def draw_dashboard(stdscr, master):
         safe_add(row, 2, "[TAKEOFF] 1=1m  2=2m  j=Land  [MOVE] i=Fwd  ,=Back  ;=Left  '=Right  [CTRL] a=Arm  d=Disarm  x=KILL  q=Quit", c_warn)
         row += 1
         
-        safe_add(row, 2, "[MODE] h=AltHold  l=Loiter  [MANUAL] W/S=Pitch  ↑↓=Thr  SPACE=Hover  [DBG] r=ROS2  e=Export  c=Cal  o=Origin", c_warn)
+        safe_add(row, 2, "[MODE] h=AltHold  l=Loiter  [MANUAL] W/S=Pitch  ↑↓=Thr  SPACE=Hover  [DBG] r=ROS2  g=SLAM  u=Study  e=Export  t=Rescan  y=TODO  c=Cal  o=Origin", c_warn)
         row += 2
 
         # ============ EVENT LOG ============
@@ -1932,11 +2861,31 @@ def draw_dashboard(stdscr, master):
                 if ROS2_AVAILABLE:
                     if state['ros2_active']:
                         fastlio_age = time.time() - state['fastlio_last_time'] if state['fastlio_last_time'] > 0 else 999
-                        update_log(f"ROS2: ACTIVE {state['fastlio_hz']:.0f}Hz | SLAM age: {fastlio_age:.1f}s | Pts: {state['fastlio_points']}")
+                        update_log(
+                            f"ROS2: ACTIVE {state['fastlio_hz']:.0f}Hz | "
+                            f"SLAM {state['slam_status']} {state['slam_quality']}% | "
+                            f"age {fastlio_age:.1f}s | Pts {state['fastlio_points']}"
+                        )
                     else:
                         update_log("ROS2: NOT ACTIVE - Check `ros2 node list` and `ros2 topic list`")
                 else:
                     update_log("ROS2: Not installed. Run: pip install rclpy")
+            elif key == ord('g'):
+                update_log(
+                    f"SLAM: {state['slam_status']} Q={state['slam_quality']}% "
+                    f"Hz={state['fastlio_hz']:.1f} Age={state['slam_age']:.2f}s "
+                    f"dZ={state['slam_pose_error']:.2f}m Drop={state['slam_dropouts']}"
+                )
+            elif key == ord('u'):
+                study = state.get('session_study', {})
+                if study:
+                    update_log(
+                        f"STUDY[{study.get('session_id', 'n/a')}]: dur {study.get('duration_s', 0.0):.1f}s "
+                        f"rows {study.get('rows', 0)} evt {study.get('event_warn', 0)}/{study.get('event_critical', 0)} "
+                        f"imu {study.get('imu_samples', 0)} pc {study.get('pc_frames', 0)}"
+                    )
+                else:
+                    update_log("STUDY: No correlated session available yet")
             elif key == ord('e'):
                 # Export comprehensive diagnostics
                 export_log = f"diag_{session_id}.txt"
@@ -1971,6 +2920,12 @@ def draw_dashboard(stdscr, master):
                     f.write(f"  Orientation: R{state['fastlio_roll']:.1f}° P{state['fastlio_pitch']:.1f}° Y{state['fastlio_yaw']:.1f}°\n")
                     f.write(f"  Point Cloud: {state['fastlio_points']:,} pts/scan\n")
                 update_log(f"Diagnostics exported to {export_log}")
+            elif key == ord('t'):
+                refresh_archive_summary(force=True)
+                update_log("ARCHIVE: Rescan complete")
+            elif key == ord('y'):
+                out = export_ops_todo()
+                update_log(f"TODO exported to {out}")
 
         # Only send RC overrides from dashboard when not in autonomous mode
         if state['macro_status'] == 'IDLE':
@@ -1978,13 +2933,237 @@ def draw_dashboard(stdscr, master):
         time.sleep(0.05)
 
 
+def draw_study_dashboard(stdscr):
+    """Offline dashboard focused on archived telemetry/event/Livox study on PC."""
+    curses.curs_set(0)
+    stdscr.nodelay(1)
+    stdscr.keypad(True)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN,  -1)
+    curses.init_pair(2, curses.COLOR_RED,    -1)
+    curses.init_pair(3, curses.COLOR_CYAN,   -1)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    curses.init_pair(5, curses.COLOR_WHITE,  -1)
+
+    messages = []
+
+    def push_msg(msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        messages.append(f"[{timestamp}] {msg}")
+        if len(messages) > 8:
+            messages.pop(0)
+
+    refresh_archive_summary(force=True)
+    sessions = collect_correlated_session_ids()
+    index = len(sessions) - 1 if sessions else 0
+    current_session = sessions[index] if sessions else ""
+    current_study = summarize_latest_session(current_session) if current_session else {}
+    current_sparks = build_session_sparklines(current_session) if current_session else {}
+    current_events = read_event_tail(current_session, max_lines=6) if current_session else []
+
+    push_msg("Study mode active (offline, no MAVLink)")
+
+    while True:
+        stdscr.erase()
+        rows, cols = stdscr.getmaxyx()
+        c_ok = curses.color_pair(1) | curses.A_BOLD
+        c_crit = curses.color_pair(2) | curses.A_BOLD
+        c_info = curses.color_pair(3) | curses.A_BOLD
+        c_warn = curses.color_pair(4) | curses.A_BOLD
+        c_neu = curses.color_pair(5)
+
+        def safe_add(row, col, text, attr=0):
+            if row < 0 or row >= rows - 1 or col < 0 or col >= cols:
+                return
+            available = cols - col - 1
+            if available <= 0:
+                return
+            try:
+                stdscr.addstr(row, col, text[:available], attr)
+            except curses.error:
+                pass
+
+        W = max(cols - 1, 1)
+        sep = "=" * W
+        mid = "─" * W
+        row = 0
+
+        archive = state.get('archive_summary', {})
+
+        safe_add(row, 0, sep, c_info)
+        row += 1
+        title = "ASCEND DATA STUDY MODE | TELEMETRY + EVENTS + LIVOX"
+        safe_add(row, max((W - len(title)) // 2, 0), title, c_ok)
+        row += 1
+        safe_add(row, 0, mid, c_info)
+        row += 1
+
+        safe_add(
+            row,
+            2,
+            (
+                f"ARCHIVE: TLM {archive.get('telemetry_files', 0):3d} | EVT {archive.get('event_files', 0):3d} | "
+                f"IMU {archive.get('imu_files', 0):3d} | PC {archive.get('pc_files', 0):3d} | "
+                f"CORR {archive.get('correlated_sessions', 0):3d}"
+            ),
+            c_info,
+        )
+        row += 1
+        safe_add(
+            row,
+            2,
+            (
+                f"TOTALS: rows {archive.get('telemetry_rows_total', 0):8d} | events {archive.get('event_lines_total', 0):6d} | "
+                f"imu {archive.get('imu_samples_total', 0):8d} | pc_frames {archive.get('pc_frames_total', 0):6d}"
+            ),
+            c_neu,
+        )
+        row += 1
+
+        safe_add(row, 0, mid, c_info)
+        row += 1
+        if current_session:
+            safe_add(
+                row,
+                2,
+                (
+                    f"SESSION [{index + 1}/{max(1, len(sessions))}]: {current_session} | "
+                    f"dur {current_study.get('duration_s', 0.0):6.1f}s | rows {current_study.get('rows', 0):6d} | "
+                    f"mode {current_study.get('flight_mode_last', 'N/A')}"
+                ),
+                c_ok,
+            )
+            row += 1
+
+            safe_add(
+                row,
+                2,
+                (
+                    f"METRICS: alt_max {current_study.get('max_alt', 0.0):6.2f}m | batt_min {current_study.get('min_batt_v', 0.0):5.2f}V | "
+                    f"vib_max {current_study.get('max_vib', 0.0):6.2f} | flow_q {current_study.get('avg_flow_qual', 0.0):5.1f} | "
+                    f"slam_hz {current_study.get('avg_fastlio_hz', 0.0):5.1f}"
+                ),
+                c_neu,
+            )
+            row += 1
+
+            safe_add(
+                row,
+                2,
+                (
+                    f"LIVOX: imu {current_study.get('imu_samples', 0):8d} peak_acc {current_study.get('imu_peak_accel', 0.0):5.2f} | "
+                    f"pointcloud frames {current_study.get('pc_frames', 0):6d} points {current_study.get('pc_points', 0):9d} | "
+                    f"events W/C {current_study.get('event_warn', 0):3d}/{current_study.get('event_critical', 0):3d}"
+                ),
+                c_neu,
+            )
+            row += 1
+        else:
+            safe_add(row, 2, "No correlated session found yet (need telemetry + events + imu + pointcloud)", c_warn)
+            row += 1
+
+        safe_add(row, 0, mid, c_info)
+        row += 1
+        safe_add(row, 2, f"TREND ALT   [{current_sparks.get('alt', 'n/a')}]", c_neu)
+        row += 1
+        safe_add(row, 2, f"TREND BATT  [{current_sparks.get('batt', 'n/a')}]", c_neu)
+        row += 1
+        safe_add(row, 2, f"TREND VIB   [{current_sparks.get('vib', 'n/a')}]", c_neu)
+        row += 1
+        safe_add(row, 2, f"TREND FLOWQ [{current_sparks.get('flow', 'n/a')}]", c_neu)
+        row += 1
+        safe_add(row, 2, f"TREND SLAM  [{current_sparks.get('slam_hz', 'n/a')}]", c_neu)
+        row += 1
+
+        safe_add(row, 0, mid, c_info)
+        row += 1
+        safe_add(row, 2, "[ EVENT TAIL ]", c_info)
+        row += 1
+        for line in current_events[-5:]:
+            color = c_crit if "CRITICAL" in line.upper() or "ABORT" in line.upper() else c_neu
+            safe_add(row, 2, line, color)
+            row += 1
+            if row >= rows - 3:
+                break
+
+        safe_add(row, 0, mid, c_info)
+        row += 1
+        safe_add(row, 2, "[KEYS] n=next session  p=prev session  r=rescan data  y=export todo  q=quit", c_warn)
+        row += 1
+        safe_add(row, 2, "[ STATUS ]", c_info)
+        row += 1
+        for msg in messages[-2:]:
+            safe_add(row, 2, msg, c_ok)
+            row += 1
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key == ord('q'):
+            break
+        elif key == ord('r'):
+            refresh_archive_summary(force=True)
+            sessions = collect_correlated_session_ids()
+            if not sessions:
+                current_session = ""
+                index = 0
+                current_study = {}
+                current_sparks = {}
+                current_events = []
+            else:
+                index = min(index, len(sessions) - 1)
+                current_session = sessions[index]
+                current_study = summarize_latest_session(current_session)
+                current_sparks = build_session_sparklines(current_session)
+                current_events = read_event_tail(current_session, max_lines=6)
+            push_msg("Archive rescanned")
+        elif key == ord('n') and sessions:
+            index = (index + 1) % len(sessions)
+            current_session = sessions[index]
+            current_study = summarize_latest_session(current_session)
+            current_sparks = build_session_sparklines(current_session)
+            current_events = read_event_tail(current_session, max_lines=6)
+            push_msg(f"Session -> {current_session}")
+        elif key == ord('p') and sessions:
+            index = (index - 1) % len(sessions)
+            current_session = sessions[index]
+            current_study = summarize_latest_session(current_session)
+            current_sparks = build_session_sparklines(current_session)
+            current_events = read_event_tail(current_session, max_lines=6)
+            push_msg(f"Session -> {current_session}")
+        elif key == ord('y'):
+            out = export_ops_todo()
+            push_msg(f"TODO exported to {out}")
+
+        time.sleep(0.05)
+
+
 # --- ENTRY POINT ---
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='ASCEND Mission Control / Study TUI')
+    parser.add_argument('--mode', choices=['auto', 'study', 'live'], default='auto')
+    parser.add_argument('--port', default='/dev/ttyAMA0', help='MAVLink serial port for live mode')
+    parser.add_argument('--baud', type=int, default=921600, help='MAVLink serial baud rate')
+    args = parser.parse_args()
+
     try:
         print("\n" + "="*70)
         print("  ASCEND MISSION CONTROL v8.0 - Rangefinder + Optical Flow")
         print("="*70)
+
+        if args.mode == 'study':
+            print("\n[*] Starting OFFLINE STUDY MODE (no MAVLink)...")
+            refresh_archive_summary(force=True)
+            curses.wrapper(draw_study_dashboard)
+            raise SystemExit(0)
+
+        if args.mode == 'auto' and not os.path.exists(args.port):
+            print(f"\n[*] Port {args.port} not found. Falling back to OFFLINE STUDY MODE.")
+            refresh_archive_summary(force=True)
+            curses.wrapper(draw_study_dashboard)
+            raise SystemExit(0)
         
         # Start ROS2 FAST-LIO subscriber if available (optional)
         if ROS2_AVAILABLE:
@@ -2004,8 +3183,8 @@ if __name__ == '__main__':
             print("\n[*] Running with Rangefinder + Optical Flow (no SLAM).")
             time.sleep(0.5)
 
-        print("\n[*] Connecting to Pixhawk on /dev/ttyAMA0 @ 921600 baud...")
-        master_conn = mavutil.mavlink_connection('/dev/ttyAMA0', baud=921600)
+        print(f"\n[*] Connecting to Pixhawk on {args.port} @ {args.baud} baud...")
+        master_conn = mavutil.mavlink_connection(args.port, baud=args.baud)
         
         print("[*] Starting MAVLink listener thread...")
         thread = threading.Thread(target=mavlink_loop, args=(master_conn,), daemon=True)
