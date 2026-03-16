@@ -68,7 +68,7 @@ CLIMB_DIST_THRESHOLD = 0.30
 POS_P_GAIN  = 50.0;  POS_I_GAIN = 1.5;  POS_DEADBAND = 0.02
 POS_MAX_ANGLE = 3.0
 
-HOVER_SETTLE_TIME = 6.0;  HOVER_DURATION = 5.0;  CLIMB_RAMP_RATE = 5
+HOVER_SETTLE_TIME = 6.0;  HOVER_DURATION = 10.0;  CLIMB_RAMP_RATE = 5
 YAW_RATE_LIMIT = 60.0;    YAW_INTEGRAL_LIMIT = 30
 
 FASTLIO_TIMEOUT        = 3.0
@@ -1611,11 +1611,120 @@ def auto_takeoff_sequence(master, target_alt=1.0):
         time.sleep(0.05)
 
     update_log("AUTO: Transitioning to LOITER (Hover)...")
-    if master: master.set_mode(master.mode_mapping()['LOITER'])
-    state['rc_throttle'] = HOVER_THR
-    send_rc_override(master)
+
+    # Retry LOITER mode switch up to 3 times — FC may reject if EKF has no position
+    loiter_ok = False
+    for attempt in range(3):
+        if master: master.set_mode(master.mode_mapping()['LOITER'])
+        for _ in range(10):  # 0.5s keepalive
+            state['rc_throttle'] = HOVER_THR
+            state['rc_pitch'] = 1500
+            state['rc_roll'] = 1500
+            state['rc_yaw'] = 1500
+            send_rc_override(master)
+            time.sleep(0.05)
+        if 'LOITER' in state['mode'].upper():
+            loiter_ok = True
+            break
+        update_log(f"AUTO: LOITER attempt {attempt+1}/3 failed, retrying...")
+
+    if not loiter_ok:
+        update_log("AUTO: LOITER REJECTED by FC! No position hold. Landing for safety.")
+        auto_land_sequence(master)
+        return
+
     set_home_position()
     state['macro_status'] = 'HOVER'
+
+    total_hover_time = HOVER_SETTLE_TIME + HOVER_DURATION
+    update_log(f"AUTO: LOITER engaged. Holding {target_alt:.0f}m for {total_hover_time:.0f}s...")
+
+    hover_start = time.time()
+    hover_drift_samples = []
+    last_log_time = time.time()
+    poor_flow_since = None
+    LOG_INTERVAL = 2.0
+
+    while (time.time() - hover_start < total_hover_time
+           and state['armed']
+           and state['macro_status'] == 'HOVER'):
+
+        current_alt = state['fused_alt']
+        elapsed = time.time() - hover_start
+
+        # Neutral sticks — LOITER FC controller owns position and altitude.
+        # Apply only a small throttle nudge if altitude drifts >15 cm.
+        alt_err = abs_target - current_alt
+        if abs(alt_err) > 0.15:
+            state['rc_throttle'] = 1500 + max(-20, min(20, int(alt_err * 60)))
+        else:
+            state['rc_throttle'] = HOVER_THR
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
+        send_rc_override(master)
+
+        update_position_estimate(0.05)
+        drift = get_drift_magnitude()
+        hover_drift_samples.append(drift)
+        if len(hover_drift_samples) > 500:
+            hover_drift_samples.pop(0)
+
+        if time.time() - last_log_time > LOG_INTERVAL:
+            phase = "SETTLE" if elapsed < HOVER_SETTLE_TIME else "HOVER"
+            vib_now = max(state['vibration_filtered'])
+            update_log(
+                f"{phase}: [{elapsed:.0f}s/{total_hover_time:.0f}s] "
+                f"Alt={current_alt:.2f}m Target={abs_target:.2f}m "
+                f"Drift={drift:.2f}m Vib={vib_now:.1f}"
+            )
+            last_log_time = time.time()
+
+        # Safety: optical-flow dropout during hover → land
+        if state['flow_qual'] < 40:
+            if poor_flow_since is None:
+                poor_flow_since = time.time()
+            elif time.time() - poor_flow_since > 2.0:
+                update_log("AUTO: OptFlow degraded during hover. Landing.")
+                auto_land_sequence(master)
+                return
+        else:
+            poor_flow_since = None
+
+        # Safety: Livox obstacle
+        if state['livox_obs'] > 0 and state['livox_obs'] < 0.6:
+            update_log(f"AUTO: Livox obstacle {state['livox_obs']:.2f}m. Landing.")
+            auto_land_sequence(master)
+            return
+
+        # Safety: vibration
+        if max(state['vibration_filtered']) > MAX_VIBRATION:
+            update_log(f"AUTO: FATAL VIB {max(state['vibration_filtered']):.1f}! KILL.")
+            emergency_disarm(master)
+            return
+
+        # Safety: tilt
+        if abs(state['roll']) > 40 or abs(state['pitch']) > 40:
+            update_log("AUTO: CRITICAL TILT during hover! KILL.")
+            emergency_disarm(master)
+            return
+
+        # Safety: battery voltage
+        if state['batt_v'] > 1.0 and state['batt_v'] < MIN_SAFE_VOLTAGE:
+            update_log(f"AUTO: CRITICAL VOLTAGE {state['batt_v']:.1f}V! Landing.")
+            break
+
+        time.sleep(0.05)
+
+    avg_drift = sum(hover_drift_samples) / max(1, len(hover_drift_samples))
+    max_drift  = max(hover_drift_samples) if hover_drift_samples else 0.0
+    update_log(
+        f"AUTO: Hover complete. Avg drift={avg_drift:.3f}m Max={max_drift:.3f}m"
+    )
+
+    if state['macro_status'] == 'HOVER':
+        update_log("AUTO: Initiating auto-land...")
+        auto_land_sequence(master)
 
 def auto_land_sequence(master):
     if state['macro_status'] not in ('IDLE', 'HOVER', 'TAKEOFF'): return

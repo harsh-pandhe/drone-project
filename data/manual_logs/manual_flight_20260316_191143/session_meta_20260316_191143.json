@@ -1,0 +1,13 @@
+{
+  "session_id": "20260316_191143",
+  "started_utc": "2026-03-16T13:41:43.384Z",
+  "mavlink_port": "/dev/ttyAMA0",
+  "mavlink_baud": 921600,
+  "snapshot_hz": 10.0,
+  "request_stream_hz": 20,
+  "output_files": {
+    "telemetry_csv": "/home/iic5/drone_project/data/manual_logs/manual_flight_20260316_191143/telemetry_snapshot_20260316_191143.csv",
+    "mavlink_jsonl": "/home/iic5/drone_project/data/manual_logs/manual_flight_20260316_191143/mavlink_raw_20260316_191143.jsonl",
+    "meta_json": "/home/iic5/drone_project/data/manual_logs/manual_flight_20260316_191143/session_meta_20260316_191143.json"
+  }
+}

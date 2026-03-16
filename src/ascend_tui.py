@@ -55,8 +55,16 @@ POS_MAX_ANGLE = 3.0       # Max pitch/roll correction: ±3° (gentle)
 
 # --- TIMING ---
 HOVER_SETTLE_TIME = 6.0   # Settle time before hover (increased from 5s)
-HOVER_DURATION = 5.0      # Hover duration for test 
+HOVER_DURATION = 10.0     # Timed hover window for repeatable 1m test, then auto-land
 CLIMB_RAMP_RATE = 5       # PWM per cycle (increased from 2 for faster climb ramp)
+TAKEOFF_REACH_MARGIN = 0.18  # Acceptable shortfall below target altitude before entering hold
+
+# --- CLIMB SAFETY & STABILITY ---
+CLIMB_TILT_DERATE_START_DEG = 12.0
+CLIMB_TILT_DERATE_HARD_DEG = 20.0
+CLIMB_TILT_LAND_DEG = 28.0
+CLIMB_TILT_LAND_HOLD_SEC = 0.4
+CLIMB_TILT_KILL_DEG = 45.0
 
 # --- YAW STABILIZATION (Compass/IMU) ---
 YAW_RATE_LIMIT = 60.0     # Max rate of change for yaw angle (degrees/second)
@@ -87,6 +95,22 @@ USE_FASTLIO_FOR_CONTROL = False
 USE_MULTISENSOR_CONTROL = True
 MAX_ALT_SENSOR_DISAGREE = 0.8
 LIVOX_MIN_SAFE_DIST = 0.8
+
+# LOITER engagement safety gates (optical-flow/rangefinder only operations)
+LOITER_ENTRY_MAX_TILT_DEG = 15.0
+PRE_LOITER_STABLE_TILT_DEG = 10.0
+PRE_LOITER_STABLE_CLIMB_MPS = 0.25
+PRE_LOITER_STABLE_SEC = 1.2
+PRE_LOITER_TIMEOUT_SEC = 4.0
+LOITER_ENTRY_CONFIRM_TILT_DEG = 12.0
+LOITER_ENTRY_CONFIRM_CLIMB_MPS = 0.25
+LOITER_ENTRY_CONFIRM_SEC = 1.2
+LOITER_ENTRY_CONFIRM_TIMEOUT_SEC = 3.0
+LOITER_ENTRY_ABORT_TILT_DEG = 25.0
+LOITER_GUARD_SEC = 2.0
+LOITER_GUARD_LAND_TILT_DEG = 30.0
+LOITER_GUARD_KILL_TILT_DEG = 55.0
+MIN_LOITER_ENTRY_AGL = 0.45
 
 # --- ARCHIVE DATA FUSION ---
 ARCHIVE_REFRESH_SEC = 8.0
@@ -183,11 +207,15 @@ state = {
     'pos_x_drift': 0.0, 'pos_y_drift': 0.0,  # Cumulative drift for debugging
     'flow_integral_x': 0.0, 'flow_integral_y': 0.0,  # Optical flow integration
     'desired_pos_x': 0.0, 'desired_pos_y': 0.0,  # Target position for hold
+    'land_requested': False,  # Queue landing request while autonomous takeoff is active
     'rtl_active': False,  # Return-to-launch active
     'sensor_status_log': [],  # Track sensor health during flight
     'slam_last_warn_time': 0.0,  # Rate-limit SLAM warnings
     # Archive fusion status
     'archive_summary': {},
+    'archive_rates': {},
+    'archive_hotspots': [],
+    'test_rig_mode': False,
     'session_study': {},
     'archive_last_scan': 0.0,
     'archive_last_error': '',
@@ -248,6 +276,9 @@ def summarize_telemetry_file(file_path):
         'max_alt': 0.0,
         'min_batt_v': 999.0,
         'max_vib': 0.0,
+        'armed_rows': 0,
+        'max_tilt': 0.0,
+        'max_alt_delta': 0.0,
         'is_lfs': False,
         'lfs_size': 0,
     }
@@ -264,12 +295,21 @@ def summarize_telemetry_file(file_path):
                 return summary
             for row in reader:
                 summary['rows'] += 1
+                if row.get('Armed', '') == 'True':
+                    summary['armed_rows'] += 1
 
                 alt = _safe_float(
                     row.get('Alt_m', row.get('Lidar_Alt_m', row.get('Baro_Alt_m', 0.0))),
                     0.0
                 )
                 summary['max_alt'] = max(summary['max_alt'], alt)
+                lidar_alt = _safe_float(row.get('Lidar_Alt_m', 0.0), 0.0)
+                if lidar_alt > 0.05:
+                    summary['max_alt_delta'] = max(summary['max_alt_delta'], abs(alt - lidar_alt))
+
+                roll = abs(_safe_float(row.get('Roll_deg', 0.0), 0.0))
+                pitch = abs(_safe_float(row.get('Pitch_deg', 0.0), 0.0))
+                summary['max_tilt'] = max(summary['max_tilt'], roll, pitch)
 
                 batt = _safe_float(row.get('Batt_V', row.get('Batt_Voltage', 0.0)), 0.0)
                 if batt > 0.0:
@@ -289,7 +329,26 @@ def summarize_telemetry_file(file_path):
 
 
 def summarize_event_file(file_path):
-    summary = {'lines': 0, 'warn': 0, 'critical': 0, 'is_lfs': False, 'lfs_size': 0}
+    summary = {
+        'lines': 0,
+        'warn': 0,
+        'critical': 0,
+        'radio_failsafe': 0,
+        'battery_failsafe': 0,
+        'mag_anomaly': 0,
+        'ekf_aiding_flip': 0,
+        'crash_disarm': 0,
+        'tilt_critical': 0,
+        'loiter_unstable': 0,
+        'climb_timeout': 0,
+        'touchdown': 0,
+        'kill': 0,
+        'rtl': 0,
+        'land_mode': 0,
+        'arm_events': 0,
+        'is_lfs': False,
+        'lfs_size': 0,
+    }
 
     if _is_lfs_pointer(file_path):
         summary['is_lfs'] = True
@@ -308,10 +367,84 @@ def summarize_event_file(file_path):
                     summary['critical'] += 1
                 elif "WARN" in upper:
                     summary['warn'] += 1
+
+                if "RADIO FAILSAFE" in upper:
+                    summary['radio_failsafe'] += 1
+                if "BATTERY FAILSAFE" in upper or ("FAILSAFE" in upper and "BATTERY" in upper):
+                    summary['battery_failsafe'] += 1
+                if (
+                    ("MAG" in upper and ("ANOMAL" in upper or "INCONSISTENT" in upper or "INTERFERENCE" in upper))
+                    or "PREFLIGHT FAIL: COMPASS" in upper
+                    or "PREFLIGHT FAIL: MAG" in upper
+                ):
+                    summary['mag_anomaly'] += 1
+                if "EKF" in upper and "AIDING" in upper and ("STOP" in upper or "START" in upper):
+                    summary['ekf_aiding_flip'] += 1
+                if "CRASH DISARM" in upper or ("DISARM" in upper and "CRASH" in upper):
+                    summary['crash_disarm'] += 1
+                if "CRITICAL: TILT" in upper or "EXTREME TILT" in upper or "CRITICAL TILT" in upper:
+                    summary['tilt_critical'] += 1
+                if "LOITER" in upper and "UNSTABLE" in upper:
+                    summary['loiter_unstable'] += 1
+                if "CLIMB TIMEOUT" in upper:
+                    summary['climb_timeout'] += 1
+                if "TOUCHDOWN" in upper and "LANDING COMPLETE" in upper:
+                    summary['touchdown'] += 1
+                if "KILL" in upper:
+                    summary['kill'] += 1
+                if "RTL" in upper:
+                    summary['rtl'] += 1
+                if "LAND MODE ENGAGED" in upper or "SWITCHING TO LAND MODE" in upper:
+                    summary['land_mode'] += 1
+                if "ARM REQUESTED" in upper or "AUTO: ARMED." in upper:
+                    summary['arm_events'] += 1
     except OSError:
         pass
 
     return summary
+
+
+def compute_archive_rates(summary):
+    """Derive compact rates from archive totals for quick risk assessment."""
+    telemetry_files = max(1, int(summary.get('telemetry_files', 0)))
+    event_files = max(1, int(summary.get('event_files', 0)))
+    armed_sessions = int(summary.get('telemetry_sessions_armed', 0))
+
+    rates = {
+        'armed_session_rate_pct': round(100.0 * armed_sessions / telemetry_files, 1),
+        'target_08_rate_pct': round(100.0 * int(summary.get('telemetry_sessions_target_08', 0)) / telemetry_files, 1),
+        'target_10_rate_pct': round(100.0 * int(summary.get('telemetry_sessions_target_10', 0)) / telemetry_files, 1),
+        'critical_event_file_rate_pct': round(100.0 * int(summary.get('event_sessions_critical', 0)) / event_files, 1),
+        'failsafe_session_rate_pct': round(100.0 * int(summary.get('sessions_with_failsafe', 0)) / event_files, 1),
+        'battery_failsafe_session_rate_pct': round(100.0 * int(summary.get('sessions_with_battery_failsafe', 0)) / event_files, 1),
+        'mag_anomaly_session_rate_pct': round(100.0 * int(summary.get('sessions_with_mag_anomaly', 0)) / event_files, 1),
+        'ekf_aiding_flip_session_rate_pct': round(100.0 * int(summary.get('sessions_with_ekf_aiding_flip', 0)) / event_files, 1),
+        'crash_disarm_session_rate_pct': round(100.0 * int(summary.get('sessions_with_crash_disarm', 0)) / event_files, 1),
+        'kill_session_rate_pct': round(100.0 * int(summary.get('sessions_with_kill', 0)) / event_files, 1),
+        'rig_pattern_session_rate_pct': round(100.0 * int(summary.get('telemetry_sessions_rig_pattern', 0)) / telemetry_files, 1),
+        'touchdown_per_armed_pct': round(
+            100.0 * int(summary.get('touchdown_total', 0)) / max(1, armed_sessions), 1
+        ),
+    }
+    return rates
+
+
+def build_failure_hotspots(summary):
+    """Rank recurring issue families for dashboard display."""
+    hotspots = [
+        ("EKF aiding flips", int(summary.get('ekf_aiding_flip_total', 0))),
+        ("Radio failsafe", int(summary.get('radio_failsafe_total', 0))),
+        ("Kill events", int(summary.get('kill_total', 0))),
+        ("Mag anomalies", int(summary.get('mag_anomaly_total', 0))),
+        ("Battery failsafe", int(summary.get('battery_failsafe_total', 0))),
+        ("Crash disarm", int(summary.get('crash_disarm_total', 0))),
+        ("Climb timeout", int(summary.get('climb_timeout_total', 0))),
+        ("Tilt critical", int(summary.get('tilt_critical_total', 0))),
+        ("LOITER unstable", int(summary.get('loiter_unstable_total', 0))),
+        ("RTL events", int(summary.get('rtl_total', 0))),
+    ]
+    hotspots.sort(key=lambda item: item[1], reverse=True)
+    return hotspots
 
 
 def summarize_livox_imu_file(file_path):
@@ -410,13 +543,45 @@ def collect_archive_summary():
         'event_lines_total': 0,
         'event_warn_total': 0,
         'event_critical_total': 0,
+        'event_sessions_nonempty': 0,
+        'event_sessions_critical': 0,
         'imu_samples_total': 0,
         'pc_frames_total': 0,
         'pc_points_total': 0,
         'max_alt_all': 0.0,
+        'max_alt_reasonable': 0.0,
         'max_vib_all': 0.0,
         'min_batt_all': 999.0,
         'max_imu_accel': 0.0,
+        'telemetry_sessions_armed': 0,
+        'telemetry_sessions_target_08': 0,
+        'telemetry_sessions_target_10': 0,
+        'telemetry_sessions_outlier_alt': 0,
+        'telemetry_sessions_high_tilt': 0,
+        'telemetry_sessions_alt_diverge': 0,
+        'telemetry_sessions_rig_pattern': 0,
+        'radio_failsafe_total': 0,
+        'battery_failsafe_total': 0,
+        'mag_anomaly_total': 0,
+        'ekf_aiding_flip_total': 0,
+        'crash_disarm_total': 0,
+        'tilt_critical_total': 0,
+        'loiter_unstable_total': 0,
+        'climb_timeout_total': 0,
+        'touchdown_total': 0,
+        'kill_total': 0,
+        'rtl_total': 0,
+        'land_mode_total': 0,
+        'arm_events_total': 0,
+        'sessions_with_failsafe': 0,
+        'sessions_with_battery_failsafe': 0,
+        'sessions_with_mag_anomaly': 0,
+        'sessions_with_ekf_aiding_flip': 0,
+        'sessions_with_crash_disarm': 0,
+        'sessions_with_tilt': 0,
+        'sessions_with_kill': 0,
+        'sessions_with_touchdown': 0,
+        'sessions_with_loiter_unstable': 0,
         'lfs_placeholders': 0,
         'lfs_declared_bytes': 0,
         'correlated_sessions': 0,
@@ -437,7 +602,23 @@ def collect_archive_summary():
         else:
             summary['telemetry_rows_total'] += ts['rows']
             summary['max_alt_all'] = max(summary['max_alt_all'], ts['max_alt'])
+            if ts['max_alt'] <= 15.0:
+                summary['max_alt_reasonable'] = max(summary['max_alt_reasonable'], ts['max_alt'])
+            else:
+                summary['telemetry_sessions_outlier_alt'] += 1
             summary['max_vib_all'] = max(summary['max_vib_all'], ts['max_vib'])
+            if ts.get('armed_rows', 0) > 0:
+                summary['telemetry_sessions_armed'] += 1
+            if ts.get('max_tilt', 0.0) >= 45.0:
+                summary['telemetry_sessions_high_tilt'] += 1
+            if ts.get('max_alt_delta', 0.0) >= 0.8:
+                summary['telemetry_sessions_alt_diverge'] += 1
+            if ts.get('max_tilt', 0.0) >= 45.0 and ts.get('max_alt_delta', 0.0) >= 0.8:
+                summary['telemetry_sessions_rig_pattern'] += 1
+            if ts['max_alt'] >= 0.8:
+                summary['telemetry_sessions_target_08'] += 1
+            if ts['max_alt'] >= 1.0:
+                summary['telemetry_sessions_target_10'] += 1
             if ts['min_batt_v'] > 0.0:
                 summary['min_batt_all'] = min(summary['min_batt_all'], ts['min_batt_v'])
         sid = _extract_session_id(os.path.basename(fp))
@@ -453,6 +634,43 @@ def collect_archive_summary():
             summary['event_lines_total'] += es['lines']
             summary['event_warn_total'] += es['warn']
             summary['event_critical_total'] += es['critical']
+            if es['lines'] > 0:
+                summary['event_sessions_nonempty'] += 1
+            if es['critical'] > 0:
+                summary['event_sessions_critical'] += 1
+
+            summary['radio_failsafe_total'] += es.get('radio_failsafe', 0)
+            summary['battery_failsafe_total'] += es.get('battery_failsafe', 0)
+            summary['mag_anomaly_total'] += es.get('mag_anomaly', 0)
+            summary['ekf_aiding_flip_total'] += es.get('ekf_aiding_flip', 0)
+            summary['crash_disarm_total'] += es.get('crash_disarm', 0)
+            summary['tilt_critical_total'] += es.get('tilt_critical', 0)
+            summary['loiter_unstable_total'] += es.get('loiter_unstable', 0)
+            summary['climb_timeout_total'] += es.get('climb_timeout', 0)
+            summary['touchdown_total'] += es.get('touchdown', 0)
+            summary['kill_total'] += es.get('kill', 0)
+            summary['rtl_total'] += es.get('rtl', 0)
+            summary['land_mode_total'] += es.get('land_mode', 0)
+            summary['arm_events_total'] += es.get('arm_events', 0)
+
+            if es.get('radio_failsafe', 0) > 0:
+                summary['sessions_with_failsafe'] += 1
+            if es.get('battery_failsafe', 0) > 0:
+                summary['sessions_with_battery_failsafe'] += 1
+            if es.get('mag_anomaly', 0) > 0:
+                summary['sessions_with_mag_anomaly'] += 1
+            if es.get('ekf_aiding_flip', 0) > 0:
+                summary['sessions_with_ekf_aiding_flip'] += 1
+            if es.get('crash_disarm', 0) > 0:
+                summary['sessions_with_crash_disarm'] += 1
+            if es.get('tilt_critical', 0) > 0:
+                summary['sessions_with_tilt'] += 1
+            if es.get('kill', 0) > 0:
+                summary['sessions_with_kill'] += 1
+            if es.get('touchdown', 0) > 0:
+                summary['sessions_with_touchdown'] += 1
+            if es.get('loiter_unstable', 0) > 0:
+                summary['sessions_with_loiter_unstable'] += 1
         sid = _extract_session_id(os.path.basename(fp))
         if sid:
             evt_sessions.add(sid)
@@ -742,15 +960,97 @@ def build_session_sparklines(session_id):
 
 def build_ops_todo(summary):
     todos = []
+    rates = compute_archive_rates(summary)
 
     if summary.get('lfs_placeholders', 0) > 0:
         todos.append("Fetch Git LFS data to unlock archived telemetry/events/Livox logs")
+
+    if summary.get('telemetry_sessions_outlier_alt', 0) > 0:
+        todos.append(
+            f"Validate altitude outliers in {summary.get('telemetry_sessions_outlier_alt', 0)} telemetry sessions (sensor spike filtering)"
+        )
+
+    if summary.get('telemetry_sessions_rig_pattern', 0) > 0:
+        todos.append(
+            f"RIG signature detected in {summary.get('telemetry_sessions_rig_pattern', 0)} sessions (high tilt + baro/lidar divergence); tag these as constrained tests"
+        )
+
+    if summary.get('telemetry_sessions_high_tilt', 0) > 0:
+        todos.append(
+            f"Study high-tilt episodes ({summary.get('telemetry_sessions_high_tilt', 0)} sessions): align rope tension timing with attitude spikes"
+        )
+
+    if summary.get('telemetry_sessions_alt_diverge', 0) > 0:
+        todos.append(
+            f"Investigate baro vs lidar divergence in {summary.get('telemetry_sessions_alt_diverge', 0)} sessions (ground effect + tether bias)"
+        )
 
     if summary.get('correlated_sessions', 0) == 0:
         todos.append("Record one full session containing telemetry + events + Livox + IMU")
 
     if summary.get('event_critical_total', 0) > 0:
-        todos.append(f"Review {summary['event_critical_total']} critical/abort events in event logs")
+        todos.append(
+            f"Review {summary['event_critical_total']} critical/abort events ({rates['critical_event_file_rate_pct']:.1f}% event-file incidence)"
+        )
+
+    if summary.get('sessions_with_failsafe', 0) > 0:
+        todos.append(
+            f"Reduce radio failsafe episodes: {summary.get('radio_failsafe_total', 0)} detections across {summary.get('sessions_with_failsafe', 0)} sessions"
+        )
+
+    if summary.get('sessions_with_battery_failsafe', 0) > 0:
+        todos.append(
+            f"Battery failsafe seen in {summary.get('sessions_with_battery_failsafe', 0)} sessions ({summary.get('battery_failsafe_total', 0)} events): verify voltage sag and failsafe thresholds"
+        )
+
+    if summary.get('sessions_with_mag_anomaly', 0) > 0:
+        todos.append(
+            f"Mag anomalies in {summary.get('sessions_with_mag_anomaly', 0)} sessions ({summary.get('mag_anomaly_total', 0)} events): recalibrate compass and review magnetic interference near rig"
+        )
+
+    if summary.get('sessions_with_ekf_aiding_flip', 0) > 0:
+        todos.append(
+            f"EKF aiding flips in {summary.get('sessions_with_ekf_aiding_flip', 0)} sessions ({summary.get('ekf_aiding_flip_total', 0)} events): stabilize sensor aiding transitions before LOITER"
+        )
+
+    if summary.get('sessions_with_crash_disarm', 0) > 0:
+        todos.append(
+            f"Crash-disarm detected in {summary.get('sessions_with_crash_disarm', 0)} sessions ({summary.get('crash_disarm_total', 0)} events): align kill policy and post-crash motor inhibit"
+        )
+
+    if summary.get('sessions_with_kill', 0) > 0:
+        todos.append(
+            f"Audit kill-path triggers: {summary.get('kill_total', 0)} kill events across {summary.get('sessions_with_kill', 0)} sessions"
+        )
+
+    if summary.get('sessions_with_tilt', 0) > 0:
+        todos.append(
+            f"Tune climb/transition attitude safety: tilt-critical appeared in {summary.get('sessions_with_tilt', 0)} sessions"
+        )
+
+    if summary.get('climb_timeout_total', 0) > 0:
+        todos.append(
+            f"Reduce climb timeout count ({summary.get('climb_timeout_total', 0)} total): adjust ascent profile and climb-response gating"
+        )
+
+    if summary.get('loiter_unstable_total', 0) > 0:
+        todos.append(
+            f"Track LOITER-entry instability ({summary.get('loiter_unstable_total', 0)} events) and tighten pre-entry stabilization"
+        )
+
+    armed_sessions = summary.get('telemetry_sessions_armed', 0)
+    if armed_sessions == 0:
+        todos.append("No armed telemetry sessions detected. Resolve arming/failsafe path first")
+    else:
+        todos.append(
+            f"Mission completion proxy (touchdown per armed): {rates['touchdown_per_armed_pct']:.1f}% ({summary.get('touchdown_total', 0)}/{armed_sessions})"
+        )
+        todos.append(
+            f"1m readiness: sessions reaching >=0.8m = {summary.get('telemetry_sessions_target_08', 0)} ({rates['target_08_rate_pct']:.1f}%)"
+        )
+        todos.append(
+            f"1m strict hit-rate: sessions reaching >=1.0m = {summary.get('telemetry_sessions_target_10', 0)} ({rates['target_10_rate_pct']:.1f}%)"
+        )
 
     if summary.get('max_vib_all', 0.0) > MAX_GROUND_VIBE:
         todos.append(f"Investigate high vibration archive peaks ({summary['max_vib_all']:.1f} m/s^2)")
@@ -775,10 +1075,26 @@ def build_ops_todo(summary):
     if not state['rangefinder_healthy']:
         todos.append("Rangefinder unhealthy; fix lidar/range stream before autonomy")
 
+    todos.append(
+        "Run next validation sequence: 5 consecutive 1m autonomous flights with no manual intervention and compare completion metrics"
+    )
+
+    todos.append(
+        "Run rope-rig protocol: three 1m flights with controlled rope restraint at hover, then compare drift/tilt signatures against free-flight baseline"
+    )
+
+    todos.append(
+        "For each rope-rig run, annotate operator action timestamps (rope pull/release, kill press) in event notes for supervised model labeling"
+    )
+
+    todos.append(
+        "Export diagnostics (`e`) and TODO (`y`) after each run to keep trend history and verify whether fixes improve rates"
+    )
+
     if not todos:
         todos.append("No high-priority blockers detected")
 
-    return todos[:6]
+    return todos[:16]
 
 
 def refresh_archive_summary(force=False):
@@ -789,6 +1105,8 @@ def refresh_archive_summary(force=False):
     try:
         summary = collect_archive_summary()
         state['archive_summary'] = summary
+        state['archive_rates'] = compute_archive_rates(summary)
+        state['archive_hotspots'] = build_failure_hotspots(summary)
         latest_corr = summary.get('latest_correlated_session', '')
         state['session_study'] = summarize_latest_session(latest_corr) if latest_corr else {}
         state['ops_todo'] = build_ops_todo(summary)
@@ -803,6 +1121,8 @@ def export_ops_todo():
     """Save a focused TODO snapshot for offline follow-up."""
     out_path = f"ops_todo_{session_id}.txt"
     summary = state.get('archive_summary', {})
+    rates = state.get('archive_rates', {})
+    hotspots = state.get('archive_hotspots', [])
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("ASCEND Ops TODO Snapshot\n")
         f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -814,6 +1134,21 @@ def export_ops_todo():
         f.write(f"- Livox PC files: {summary.get('pc_files', 0)}\n")
         f.write(f"- Correlated sessions: {summary.get('correlated_sessions', 0)}\n")
         f.write(f"- LFS placeholders: {summary.get('lfs_placeholders', 0)}\n\n")
+        f.write("Archive Rates\n")
+        f.write(f"- Armed session rate: {rates.get('armed_session_rate_pct', 0.0)}%\n")
+        f.write(f"- >=0.8m session rate: {rates.get('target_08_rate_pct', 0.0)}%\n")
+        f.write(f"- >=1.0m session rate: {rates.get('target_10_rate_pct', 0.0)}%\n")
+        f.write(f"- Critical event-file rate: {rates.get('critical_event_file_rate_pct', 0.0)}%\n")
+        f.write(f"- Failsafe session rate: {rates.get('failsafe_session_rate_pct', 0.0)}%\n")
+        f.write(f"- Battery failsafe session rate: {rates.get('battery_failsafe_session_rate_pct', 0.0)}%\n")
+        f.write(f"- Mag anomaly session rate: {rates.get('mag_anomaly_session_rate_pct', 0.0)}%\n")
+        f.write(f"- EKF aiding flip session rate: {rates.get('ekf_aiding_flip_session_rate_pct', 0.0)}%\n")
+        f.write(f"- Crash disarm session rate: {rates.get('crash_disarm_session_rate_pct', 0.0)}%\n")
+        f.write(f"- Touchdown per armed: {rates.get('touchdown_per_armed_pct', 0.0)}%\n\n")
+        f.write("Failure Hotspots\n")
+        for label, count in hotspots[:6]:
+            f.write(f"- {label}: {count}\n")
+        f.write("\n")
         f.write("TODO\n")
         for idx, item in enumerate(state.get('ops_todo', []), start=1):
             f.write(f"{idx}. {item}\n")
@@ -839,11 +1174,14 @@ def update_vibration_filter(new_vib):
 def send_rc_override(master):
     """Sends current stick positions to Pixhawk via RC channels override."""
     if not master: return
-    master.mav.rc_channels_override_send(
-        master.target_system, master.target_component,
-        int(state['rc_roll']), int(state['rc_pitch']), int(state['rc_throttle']), int(state['rc_yaw']),
-        0, 0, 0, 0
-    )
+    try:
+        master.mav.rc_channels_override_send(
+            master.target_system, master.target_component,
+            int(state['rc_roll']), int(state['rc_pitch']), int(state['rc_throttle']), int(state['rc_yaw']),
+            0, 0, 0, 0
+        )
+    except Exception as e:
+        update_log(f"WARN: RC override send error: {e}")
 
 
 def emergency_disarm(master):
@@ -1462,7 +1800,7 @@ def update_slam_metrics():
     else:
         state['slam_status'] = 'WEAK'
 
-    if state['armed'] and age > FASTLIO_STALE_WARN_SEC:
+    if USE_FASTLIO_FOR_CONTROL and state['armed'] and age > FASTLIO_STALE_WARN_SEC:
         if now - state['slam_last_warn_time'] > SLAM_WARN_INTERVAL:
             update_log(f"⚠ WARNING: SLAM stale ({age:.1f}s)")
             state['slam_last_warn_time'] = now
@@ -1717,8 +2055,8 @@ def run_preflight_diagnostics():
         )
         return False
 
-    if not state['rangefinder_healthy'] and state.get('slam_quality', 0) < 55:
-        update_log("DIAG: FAIL - Rangefinder unavailable and SLAM weak. Autonomous takeoff blocked.")
+    if not state['rangefinder_healthy']:
+        update_log("DIAG: FAIL - Rangefinder not healthy. Required for optical-flow-only flight.")
         return False
 
     # FAST-LIO health check
@@ -1761,6 +2099,7 @@ def auto_takeoff_sequence(master, target_alt=None):
         target_alt = TARGET_ALTITUDE
     
     if state['macro_status'] != 'IDLE': return
+    state['land_requested'] = False
     state['macro_status'] = 'TAKEOFF'
     
     if not run_preflight_diagnostics():
@@ -1872,42 +2211,71 @@ def auto_takeoff_sequence(master, target_alt=None):
 
     # 7. CLIMB PHASE
     # In ALT_HOLD: throttle > 1500 = climb at rate proportional to deflection
-    # 1700 = strong climb (~40% of max range), 1580 = gentle approach
-    CLIMB_THR = 1700       # Strong climb command
-    APPROACH_THR = 1580    # Gentler climb for final 30cm
-    FINE_THR = 1530        # Very gentle for last 10cm
+    # Keep climb commands conservative; aggressive throttle correlated with tilt spikes.
+    CLIMB_THR = 1660       # Reduced from 1700 to lower pitch-up impulse
+    APPROACH_THR = 1560    # Gentler climb for final 30cm
+    FINE_THR = 1525        # Very gentle for last 10cm
     CLIMB_TIMEOUT = 15.0 + target_alt * 5.0  # More time for higher altitudes
     
     climb_start = time.time()
     
     # Ramp from spool throttle to full climb throttle
-    for thr in range(SPOOL_THR, CLIMB_THR, 10):
+    for thr in range(SPOOL_THR, CLIMB_THR, max(2, CLIMB_RAMP_RATE)):
         state['rc_throttle'] = thr
         state['rc_pitch'] = 1500
         state['rc_roll'] = 1500
         state['rc_yaw'] = 1500
         send_rc_override(master)
-        time.sleep(0.02)
+        time.sleep(0.03)
     
     update_log("AUTO: Full climb power. Monitoring altitude...")
     last_alt_log = time.time()
     no_climb_since = None
+    tilt_unstable_since = None
     
-    while time.time() - climb_start < CLIMB_TIMEOUT and state['armed']:
+    climb_exit_reason = 'timeout'
+
+    while time.time() - climb_start < CLIMB_TIMEOUT:
+        if not state['armed']:
+            climb_exit_reason = 'disarmed'
+            break
+
         current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else get_best_altitude_for_control()
         fused_climb = get_fused_climb_rate()
         alt_remaining = abs_target - current_alt
         
         # Staged throttle: reduce as we approach target and damp with climb-rate feedback.
         if alt_remaining < 0.10:
-            state['rc_throttle'] = 1515
+            state['rc_throttle'] = FINE_THR
         elif alt_remaining < 0.30:
-            state['rc_throttle'] = 1560 if fused_climb < 0.22 else 1530
+            state['rc_throttle'] = APPROACH_THR if fused_climb < 0.22 else 1530
         else:
-            state['rc_throttle'] = 1680 if fused_climb < 0.15 else 1620
+            state['rc_throttle'] = CLIMB_THR if fused_climb < 0.15 else 1600
 
-        # Dynamic confidence adjustment: if fused confidence is low, avoid aggressive climb.
-        if state.get('fused_conf', 0) < 45:
+        # Attitude-aware derating: reduce climb authority when tilt starts diverging.
+        climb_tilt = max(abs(state['roll']), abs(state['pitch']))
+        if climb_tilt > CLIMB_TILT_DERATE_START_DEG:
+            if climb_tilt >= CLIMB_TILT_DERATE_HARD_DEG:
+                state['rc_throttle'] = min(state['rc_throttle'], 1520)
+            else:
+                state['rc_throttle'] = min(state['rc_throttle'], 1560)
+
+        # If tilt remains high during climb, hand over to LAND before it escalates.
+        if climb_tilt > CLIMB_TILT_LAND_DEG:
+            if tilt_unstable_since is None:
+                tilt_unstable_since = time.time()
+            elif time.time() - tilt_unstable_since > CLIMB_TILT_LAND_HOLD_SEC:
+                update_log(
+                    f"AUTO: Climb unstable (tilt {climb_tilt:.1f}deg). Switching to LAND for safety."
+                )
+                state['macro_status'] = 'HOVER'
+                auto_land_sequence(master)
+                return
+        else:
+            tilt_unstable_since = None
+
+        # Dynamic confidence adjustment only when multisensor fusion is active.
+        if USE_MULTISENSOR_CONTROL and state.get('fused_conf', 0) < 45:
             state['rc_throttle'] = min(state['rc_throttle'], 1600)
 
         # Livox obstacle gate during ascent.
@@ -1921,9 +2289,15 @@ def auto_takeoff_sequence(master, target_alt=None):
         state['rc_yaw'] = 1500
         send_rc_override(master)
         
-        # Check if target reached (within 5cm)
-        if current_alt >= abs_target - 0.05:
+        # Check if target reached within practical test margin.
+        if current_alt >= abs_target - TAKEOFF_REACH_MARGIN:
+            climb_exit_reason = 'reached'
             update_log(f"AUTO: Target reached at {current_alt:.2f}m")
+            break
+
+        if state.get('land_requested'):
+            climb_exit_reason = 'land_requested'
+            update_log("AUTO: Landing requested during takeoff. Exiting climb phase.")
             break
 
         # Abort if FC is not responding to climb command despite enough margin.
@@ -1944,14 +2318,15 @@ def auto_takeoff_sequence(master, target_alt=None):
         if time.time() - last_alt_log > 1.0:
             update_log(
                 f"AUTO: Climbing... {current_alt:.2f}m / {abs_target:.2f}m "
-                f"(remaining: {alt_remaining:.2f}m, climb: {fused_climb:.2f}m/s, conf:{state.get('fused_conf', 0)}%)"
+                f"(remaining: {alt_remaining:.2f}m, climb: {fused_climb:.2f}m/s, tilt:{climb_tilt:.1f}deg, "
+                f"thr:{int(state['rc_throttle'])}, conf:{state.get('fused_conf', 0)}%)"
             )
             last_alt_log = time.time()
         
         time.sleep(0.05)
         
         # Safety: tilt check
-        if abs(state['roll']) > 35 or abs(state['pitch']) > 35:
+        if abs(state['roll']) > CLIMB_TILT_KILL_DEG or abs(state['pitch']) > CLIMB_TILT_KILL_DEG:
             update_log("AUTO: CRITICAL TILT during climb! KILL.")
             emergency_disarm(master)
             return
@@ -1960,18 +2335,90 @@ def auto_takeoff_sequence(master, target_alt=None):
             update_log(f"AUTO: FATAL VIB during climb ({max(state['vibration_filtered']):.1f})! KILL.")
             emergency_disarm(master)
             return
-    else:
-        # Loop ended via timeout (while condition became false)
-        current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
-            state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
+        state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
+    )
+
+    if climb_exit_reason == 'disarmed':
+        update_log(f"AUTO: ABORT! FC disarmed during climb at {current_alt:.2f}m.")
+        state['macro_status'] = 'IDLE'
+        return
+    if climb_exit_reason == 'land_requested':
+        current_agl = current_alt - ground_alt
+        if current_agl < MIN_LOITER_ENTRY_AGL:
+            update_log(
+                f"AUTO: Landing requested but altitude too low ({current_agl:.2f}m AGL). Keeping FC control, then landing."
+            )
+        state['macro_status'] = 'HOVER'
+        auto_land_sequence(master)
+        return
+    if climb_exit_reason == 'timeout':
+        update_log(f"AUTO: Climb timeout at {current_alt:.2f}m. Proceeding to hold/land checks.")
+
+    current_agl = current_alt - ground_alt
+    if current_agl < MIN_LOITER_ENTRY_AGL:
+        update_log(
+            f"AUTO: ABORT! Altitude too low for LOITER hold ({current_agl:.2f}m AGL). Landing."
         )
-        update_log(f"AUTO: Climb timeout at {current_alt:.2f}m. Proceeding to hover.")
+        state['macro_status'] = 'HOVER'  # Allow auto_land_sequence to run
+        auto_land_sequence(master)
+        return
 
     if not state['armed']:
         state['macro_status'] = 'IDLE'
         return
 
-    # 8. HOVER PHASE - Use LOITER for FC-native position hold
+    # 8. Pre-LOITER stabilization in ALT_HOLD.
+    # Require a short continuous stable window before switching modes.
+    update_log("AUTO: Stabilizing before LOITER...")
+    stable_since = None
+    settle_start = time.time()
+    while state['armed'] and state['macro_status'] == 'TAKEOFF':
+        elapsed = time.time() - settle_start
+        if elapsed > PRE_LOITER_TIMEOUT_SEC:
+            update_log("AUTO: Pre-LOITER stabilization timeout. Landing for safety.")
+            state['macro_status'] = 'HOVER'
+            auto_land_sequence(master)
+            return
+
+        if state.get('land_requested'):
+            update_log("AUTO: Landing requested during pre-LOITER stabilization.")
+            state['macro_status'] = 'HOVER'
+            auto_land_sequence(master)
+            return
+
+        current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else get_best_altitude_for_control()
+        current_agl = current_alt - ground_alt
+        fused_climb = abs(get_fused_climb_rate())
+        tilt_ok = (
+            abs(state['roll']) <= PRE_LOITER_STABLE_TILT_DEG and
+            abs(state['pitch']) <= PRE_LOITER_STABLE_TILT_DEG
+        )
+        climb_ok = fused_climb <= PRE_LOITER_STABLE_CLIMB_MPS
+        agl_ok = current_agl >= MIN_LOITER_ENTRY_AGL
+
+        state['rc_throttle'] = HOVER_THR
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
+        send_rc_override(master)
+
+        if tilt_ok and climb_ok and agl_ok:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= PRE_LOITER_STABLE_SEC:
+                update_log("AUTO: Pre-LOITER stabilization PASS.")
+                break
+        else:
+            stable_since = None
+
+        time.sleep(0.05)
+
+    if not state['armed']:
+        state['macro_status'] = 'IDLE'
+        return
+
+    # 9. HOVER PHASE - Use LOITER for FC-native position hold
     # LOITER mode uses EKF position estimate (from optical flow + rangefinder)
     # to hold both altitude AND horizontal position. All sticks at 1500 = hold.
     # This is MUCH better than ALT_HOLD (altitude only, no position hold).
@@ -1998,10 +2445,60 @@ def auto_takeoff_sequence(master, target_alt=None):
     
     if not loiter_ok:
         update_log("AUTO: LOITER REJECTED by FC! No position hold available. Landing for safety.")
+        state['macro_status'] = 'HOVER'  # Allow auto_land_sequence to run
         auto_land_sequence(master)
         return
     
     update_log(f"AUTO: LOITER engaged. FC holding position for {total_hover_time:.0f}s...")
+
+    # Guard LOITER entry with a short confirmation window.
+    # This avoids false starts where attitude spikes immediately after mode switch.
+    confirm_start = time.time()
+    stable_since = None
+    while state['armed'] and state['macro_status'] == 'TAKEOFF':
+        elapsed = time.time() - confirm_start
+        if elapsed > LOITER_ENTRY_CONFIRM_TIMEOUT_SEC:
+            update_log("AUTO: LOITER entry did not stabilize in time. Landing.")
+            state['macro_status'] = 'HOVER'
+            auto_land_sequence(master)
+            return
+
+        if state.get('land_requested'):
+            update_log("AUTO: Landing requested during LOITER entry confirm.")
+            state['macro_status'] = 'HOVER'
+            auto_land_sequence(master)
+            return
+
+        if abs(state['roll']) > LOITER_ENTRY_ABORT_TILT_DEG or abs(state['pitch']) > LOITER_ENTRY_ABORT_TILT_DEG:
+            update_log(
+                f"AUTO: LOITER entry unstable (R={state['roll']:.1f} P={state['pitch']:.1f}). Landing."
+            )
+            state['macro_status'] = 'HOVER'
+            auto_land_sequence(master)
+            return
+
+        fused_climb = abs(get_fused_climb_rate())
+        tilt_ok = (
+            abs(state['roll']) <= LOITER_ENTRY_CONFIRM_TILT_DEG and
+            abs(state['pitch']) <= LOITER_ENTRY_CONFIRM_TILT_DEG
+        )
+        climb_ok = fused_climb <= LOITER_ENTRY_CONFIRM_CLIMB_MPS
+
+        state['rc_throttle'] = HOVER_THR
+        state['rc_pitch'] = 1500
+        state['rc_roll'] = 1500
+        state['rc_yaw'] = 1500
+        send_rc_override(master)
+
+        if tilt_ok and climb_ok:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= LOITER_ENTRY_CONFIRM_SEC:
+                break
+        else:
+            stable_since = None
+
+        time.sleep(0.05)
     
     state['rc_throttle'] = HOVER_THR  # 1500 = neutral = hold altitude
     state['rc_pitch'] = 1500          # In LOITER: 1500 = hold position
@@ -2022,15 +2519,16 @@ def auto_takeoff_sequence(master, target_alt=None):
         current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else (
             state['lidar_alt'] if state['rangefinder_healthy'] else state['alt']
         )
+        elapsed = time.time() - hover_start
+
+        if state.get('land_requested'):
+            update_log("AUTO: Landing requested. Leaving hover and starting LAND.")
+            break
         
-        # ALL STICKS NEUTRAL - FC handles everything in LOITER
-        # In LOITER: pitch/roll 1500 = hold position (FC uses optical flow)
-        # In ALT_HOLD: pitch/roll 1500 = level (no position hold)
+        # ALL STICKS NEUTRAL — LOITER mode owns altitude + position.
+        # Throttle 1500 = neutral; FC holds altitude via rangefinder EKF.
+        # Do NOT nudge throttle — it fights ArduCopter's LOITER altitude PID.
         state['rc_throttle'] = HOVER_THR  # 1500
-        # Mild correction in LOITER if fused altitude drifts too much.
-        alt_err = abs_target - current_alt
-        if abs(alt_err) > 0.15:
-            state['rc_throttle'] = 1500 + max(-20, min(20, int(alt_err * 60)))
         state['rc_pitch'] = 1500
         state['rc_roll'] = 1500
         state['rc_yaw'] = 1500
@@ -2074,8 +2572,21 @@ def auto_takeoff_sequence(master, target_alt=None):
             update_log(f"AUTO: FATAL VIB during hover ({max(state['vibration_filtered']):.1f})! KILL.")
             emergency_disarm(master)
             return
-        # Safety: tilt
-        if abs(state['roll']) > 40 or abs(state['pitch']) > 40:
+        # Safety: LOITER guard window right after engagement.
+        # If attitude starts to diverge, switch to LAND first; keep KILL for extreme tilt.
+        if elapsed < LOITER_GUARD_SEC:
+            if abs(state['roll']) > LOITER_GUARD_KILL_TILT_DEG or abs(state['pitch']) > LOITER_GUARD_KILL_TILT_DEG:
+                update_log("AUTO: EXTREME TILT during LOITER engage! KILL.")
+                emergency_disarm(master)
+                return
+            if abs(state['roll']) > LOITER_GUARD_LAND_TILT_DEG or abs(state['pitch']) > LOITER_GUARD_LAND_TILT_DEG:
+                update_log("AUTO: LOITER unstable during engage. Switching to LAND.")
+                state['macro_status'] = 'HOVER'  # Allow auto_land_sequence to run
+                auto_land_sequence(master)
+                return
+
+        # Safety: tilt (outside engage guard)
+        if abs(state['roll']) > LOITER_GUARD_KILL_TILT_DEG or abs(state['pitch']) > LOITER_GUARD_KILL_TILT_DEG:
             update_log("AUTO: CRITICAL TILT during hover! KILL.")
             emergency_disarm(master)
             return
@@ -2089,7 +2600,7 @@ def auto_takeoff_sequence(master, target_alt=None):
     max_drift = max(hover_drift_samples) if hover_drift_samples else 0
     update_log(f"AUTO: Hover complete. Avg drift: {avg_drift:.3f}m, Max: {max_drift:.3f}m")
     
-    # 9. Transition to landing (only if not already started by 'j' key)
+    # 10. Transition to landing (only if not already started by 'j' key)
     if state['macro_status'] == 'HOVER':
         update_log("AUTO: Initiating landing sequence...")
         auto_land_sequence(master)
@@ -2115,6 +2626,8 @@ def auto_land_sequence(master):
     if state['macro_status'] not in ('IDLE', 'HOVER'):
         update_log("LAND: Cannot land during " + state['macro_status'] + ". Use 'x' to abort.")
         return
+
+    state['land_requested'] = False
     
     # Guard: must be armed and airborne
     if not state['armed']:
@@ -2163,8 +2676,8 @@ def auto_land_sequence(master):
         
         current_alt = get_fused_altitude_for_control() if USE_MULTISENSOR_CONTROL else get_best_altitude_for_control()
         
-        # TILT SAFETY: if drone tilts > 30° during landing, emergency disarm
-        if abs(state['roll']) > 30 or abs(state['pitch']) > 30:
+        # TILT SAFETY: disarm only on extreme attitude during landing.
+        if abs(state['roll']) > 55 or abs(state['pitch']) > 55:
             update_log(f"LAND: TILT ABORT Roll={state['roll']:.0f}° Pitch={state['pitch']:.0f}°")
             emergency_disarm(master)
             return
@@ -2418,8 +2931,20 @@ def mavlink_loop(master):
             state['cpu_load']  = msg.load / 10.0
 
         elif m_type == 'HEARTBEAT':
-            state['armed'] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-            state['mode']  = mavutil.mode_string_v10(msg)
+            # Accept FC heartbeats even when target_component is broadcast (0),
+            # but continue ignoring companion/GCS components to prevent mode flicker.
+            src_sys = msg.get_srcSystem() if hasattr(msg, 'get_srcSystem') else None
+            src_comp = msg.get_srcComponent() if hasattr(msg, 'get_srcComponent') else None
+            target_comp = int(getattr(master, 'target_component', 0) or 0)
+
+            is_fc_heartbeat = (
+                src_sys == master.target_system and
+                (src_comp == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1 or target_comp == 0 or src_comp == target_comp)
+            )
+
+            if is_fc_heartbeat:
+                state['armed'] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                state['mode']  = mavutil.mode_string_v10(msg)
 
         elif m_type == 'EKF_STATUS_REPORT':
             state['ekf_flags'] = msg.flags
@@ -2489,8 +3014,11 @@ def draw_dashboard(stdscr, master):
         # ============ HEADER ============
         safe_add(row, 0, sep, c_info)
         row += 1
-        header = "ASCEND v8.0 MISSION CONTROL | FAST-LIO Edition"
+        header = "ASCEND v8.0 MISSION CONTROL | Pixhawk 6C OF+Rangefinder"
         safe_add(row, (W - len(header)) // 2, header, c_ok)
+        row += 1
+        rig_hdr = "TEST PROFILE: RIG-CONSTRAINED" if state.get('test_rig_mode') else "TEST PROFILE: FREE-FLIGHT"
+        safe_add(row, (W - len(rig_hdr)) // 2, rig_hdr, c_warn if state.get('test_rig_mode') else c_neu)
         row += 1
 
         # ============ CRITICAL ALERTS ============
@@ -2526,17 +3054,24 @@ def draw_dashboard(stdscr, master):
         best_alt, alt_source, alt_conf = get_best_altitude_estimate()
         remaining_time = get_battery_time_remaining()
         
+        lidar_ok_icon = "●" if state['rangefinder_healthy'] else "○ WARN"
+        flow_ok_icon  = "●" if state['flow_qual'] >= 80 else ("~ LOW" if state['flow_qual'] >= 40 else "○ FAIL")
         status_bar = (
-            f"MODE:{state['mode']:<12} | PHASE:{state['macro_status']:<8} | "
-            f"SLAM:{state['slam_status']:<8}({state['slam_quality']:3d}%) | "
-            f"EST:{alt_source}({alt_conf:3d}%) | FUSE:{state.get('fused_conf', 0):3d}% | "
-            f"TIME:{remaining_time:5.1f}min | LINK:{estimate_link_quality():3d}%"
+            f"MODE:{state['mode']:<10} PHASE:{state['macro_status']:<8} "
+            f"CTL:LIDAR+FLOW  "
+            f"TEST:1m/{HOVER_DURATION:.0f}s  "
+            f"LIDAR:{state['lidar_alt']:.2f}m {lidar_ok_icon}  "
+            f"FLOW:Q{state['flow_qual']:3d} {flow_ok_icon}  "
+            f"BATT:{state['batt_v']:.1f}V {state['batt_pct']:2d}%  "
+            f"TIME:{remaining_time:4.1f}min"
         )
         safe_add(row, 2, status_bar, c_info)
         row += 1
 
         # ============ ARCHIVE DATA FUSION ==========
         archive = state.get('archive_summary', {})
+        rates = state.get('archive_rates', {})
+        hotspots = state.get('archive_hotspots', [])
         if archive:
             safe_add(row, 0, mid, c_info)
             row += 1
@@ -2567,6 +3102,35 @@ def draw_dashboard(stdscr, master):
             safe_add(row, 2, lfs_line, c_warn if lfs_count else c_ok)
             row += 1
 
+            rates_line = (
+                f"RATES: armed {rates.get('armed_session_rate_pct', 0.0):5.1f}% | >=0.8m {rates.get('target_08_rate_pct', 0.0):5.1f}% "
+                f"| >=1.0m {rates.get('target_10_rate_pct', 0.0):5.1f}% | critical_evt {rates.get('critical_event_file_rate_pct', 0.0):5.1f}% "
+                f"| failsafe_evt {rates.get('failsafe_session_rate_pct', 0.0):5.1f}%"
+            )
+            safe_add(row, 2, rates_line, c_warn)
+            row += 1
+
+            anomaly_line = (
+                f"ANOMALY: batt_fs {rates.get('battery_failsafe_session_rate_pct', 0.0):5.1f}% | mag {rates.get('mag_anomaly_session_rate_pct', 0.0):5.1f}% "
+                f"| ekf_flip {rates.get('ekf_aiding_flip_session_rate_pct', 0.0):5.1f}% | crash_disarm {rates.get('crash_disarm_session_rate_pct', 0.0):5.1f}% "
+                f"| rig_pat {rates.get('rig_pattern_session_rate_pct', 0.0):5.1f}%"
+            )
+            safe_add(row, 2, anomaly_line, c_warn)
+            row += 1
+
+            if hotspots:
+                hot_text = " | ".join([f"{label}:{count}" for label, count in hotspots[:3]])
+                safe_add(row, 2, f"HOTSPOTS: {hot_text}", c_crit)
+                row += 1
+
+            rig_line = (
+                f"RIG-ANALYSIS: high_tilt_sessions {archive.get('telemetry_sessions_high_tilt', 0):3d} | "
+                f"alt_diverge_sessions {archive.get('telemetry_sessions_alt_diverge', 0):3d} | "
+                f"rig_pattern_sessions {archive.get('telemetry_sessions_rig_pattern', 0):3d}"
+            )
+            safe_add(row, 2, rig_line, c_warn)
+            row += 1
+
             study = state.get('session_study', {})
             if study:
                 study_line1 = (
@@ -2580,7 +3144,7 @@ def draw_dashboard(stdscr, master):
                     f"       EVT w/c {study.get('event_warn', 0):3d}/{study.get('event_critical', 0):3d} | "
                     f"IMU {study.get('imu_samples', 0):7d} pk {study.get('imu_peak_accel', 0.0):5.2f} | "
                     f"PC {study.get('pc_frames', 0):5d}/{study.get('pc_points', 0):8d} | "
-                    f"FlowQ {study.get('avg_flow_qual', 0.0):5.1f} | SLAMHz {study.get('avg_fastlio_hz', 0.0):5.1f}"
+                    f"FlowQ {study.get('avg_flow_qual', 0.0):5.1f}"
                 )
                 safe_add(row, 2, study_line2, c_neu)
                 row += 1
@@ -2589,7 +3153,7 @@ def draw_dashboard(stdscr, master):
                 safe_add(row, 2, f"ARCHIVE ERROR: {state['archive_last_error']}", c_crit)
                 row += 1
 
-            for idx, todo_text in enumerate(state.get('ops_todo', [])[:3], start=1):
+            for idx, todo_text in enumerate(state.get('ops_todo', [])[:8], start=1):
                 safe_add(row, 2, f"TODO {idx}: {todo_text}", c_warn)
                 row += 1
 
@@ -2599,13 +3163,13 @@ def draw_dashboard(stdscr, master):
         row += 1
         
         # Altitude readout with all estimates
-        alt_color = c_ok if abs(state['lidar_alt'] - state['alt']) < 0.3 else c_warn
-        fused_alt = state.get('fused_alt', best_alt)
-        fw = state.get('fused_weights', {'lidar': 0.0, 'slam': 0.0, 'baro': 1.0})
+        lb_diff = abs(state['lidar_alt'] - state['alt'])
+        alt_color = c_ok if state['rangefinder_healthy'] else c_crit
+        lidar_icon = "●" if state['rangefinder_healthy'] else "○"
         alt_line = (
-            f"ALT: {best_alt:7.2f}m [{alt_source}] FUSED:{fused_alt:6.2f}m({state.get('fused_source', '?')}) "
-            f"L/S/B:{fw.get('lidar', 0.0):.2f}/{fw.get('slam', 0.0):.2f}/{fw.get('baro', 0.0):.2f} "
-            f"ΔLB:{abs(state['lidar_alt']-state['alt']):6.3f}m"
+            f"ALT: LIDAR {lidar_icon} {state['lidar_alt']:7.3f}m   "
+            f"BARO {state['alt']:7.2f}m   ΔLB:{lb_diff:5.3f}m   "
+            f"FLOW Vx:{state['flow_vx']:+.3f} Vy:{state['flow_vy']:+.3f} Q:{state['flow_qual']:3d}/255"
         )
         safe_add(row, 2, alt_line, alt_color)
         row += 1
@@ -2624,28 +3188,19 @@ def draw_dashboard(stdscr, master):
 
         # ============ NAVIGATION & POSITIONING ============
         safe_add(row, 0, mid, c_info)
-        safe_add(row, 2, "[ NAVIGATION ]", c_info)
+        safe_add(row, 2, "[ NAVIGATION — SLAM/LIVOX DISABLED (LIDAR+FLOW only) ]", c_info)
         row += 1
-        
-        slam_conf = get_sensor_confidence("SLAM")
-        slam_status = get_sensor_health_char(state['fastlio_healthy'])
-        slam_line1 = (
-            f"SLAM: {slam_status} {state['fastlio_hz']:.0f}Hz {state['slam_status']:<8} "
-            f"Pos{format_position_compact(state['fastlio_x'], state['fastlio_y'], state['fastlio_z'])} "
-            f"Q:{slam_conf:3d}%  Pts:{state['fastlio_points']:6d}"
+
+        slam_conf = 0  # SLAM not used for control
+        flow_spark = create_sparkline(state['flow_history'][-20:] if state.get('flow_history') else [], width=12)
+        nav_line = (
+            f"OptFlow Vx:{state['flow_vx']:+6.3f} Vy:{state['flow_vy']:+6.3f} m/s  "
+            f"Mag:{state['flow_magnitude']:.3f}m/s  "
+            f"Drift:{get_drift_magnitude():.3f}m  "
+            f"Trend:[{flow_spark}]"
         )
-        slam_color = c_ok if state['slam_status'] == 'GOOD' else c_warn if slam_conf > 0 else c_neu
-        safe_add(row, 2, slam_line1, slam_color)
-        row += 1
-        
-        slam_vel_mag = math.sqrt(state['fastlio_vx']**2 + state['fastlio_vy']**2 + state['fastlio_vz']**2)
-        slam_err_spark = create_sparkline(state['slam_error_history'][-10:], width=8)
-        slam_line2 = (
-            f"      Vel{format_position_compact(state['fastlio_vx'], state['fastlio_vy'], state['fastlio_vz'])} "
-            f"(mag:{slam_vel_mag:6.3f}m/s)  Age:{state['slam_age']:4.1f}s  Δz:{state['slam_pose_error']:5.2f}m "
-            f"Drop:{state['slam_dropouts']:3d} [{slam_err_spark}]"
-        )
-        safe_add(row, 2, slam_line2, slam_color)
+        flow_nav_color = c_ok if state['flow_qual'] >= 80 else c_warn if state['flow_qual'] >= 40 else c_crit
+        safe_add(row, 2, nav_line, flow_nav_color)
         row += 1
 
         # ============ SENSOR HEALTH MATRIX ============
@@ -2660,29 +3215,18 @@ def draw_dashboard(stdscr, master):
         lidar_stat = f"LIDAR {get_sensor_health_char(state['rangefinder_healthy'])} {lidar_conf:3d}%"
         baro_stat = f"BARO  {get_sensor_health_char(True)} {baro_conf:3d}%"
         optflow_stat = f"OPTFLOW {get_sensor_health_char(state['flow_qual'] > 50)} {optflow_conf:3d}% Q:{state['flow_qual']:3d}/255"
-        slam_stat = f"SLAM {get_sensor_health_char(state['fastlio_healthy'])} {slam_conf:3d}%"
-        livox_stat = f"LIVOX {get_sensor_health_char(state['livox_obs'] > 0)} Obs:{state['livox_obs']:5.2f}m Sectors:{state['livox_sectors']:2d}"
-        
-        health_color_lidar = c_ok if lidar_conf > 70 else c_warn if lidar_conf > 0 else c_neu
-        health_color_baro = c_ok
-        health_color_opt = c_ok if optflow_conf > 70 else c_warn if optflow_conf > 0 else c_neu
-        health_color_slam = c_ok if slam_conf > 70 else c_warn if slam_conf > 0 else c_neu
-        health_color_livox = c_ok if state['livox_obs'] > 0 else c_neu
-        
-        safe_add(row, 2, lidar_stat, health_color_lidar)
-        safe_add(row, 22, baro_stat, health_color_baro)
+        health_color_lidar = c_ok if lidar_conf > 70 else c_warn if lidar_conf > 0 else c_crit
+        health_color_baro  = c_ok
+        health_color_opt   = c_ok if optflow_conf > 70 else c_warn if optflow_conf > 0 else c_crit
+
+        safe_add(row, 2, lidar_stat,   health_color_lidar)
+        safe_add(row, 22, baro_stat,   health_color_baro)
         safe_add(row, 38, optflow_stat, health_color_opt)
-        safe_add(row, 60, slam_stat, health_color_slam)
+        safe_add(row, 60, "NAV:FLOW+RNG", c_neu)
         row += 1
-        
-        safe_add(row, 2, livox_stat, health_color_livox)
-        safe_add(row, 30, f"EKF: 0x{state['ekf_flags']:04X}  Vision: {format_position_compact(state['vision_x'], state['vision_y'], state['vision_z'])}", c_neu)
-        row += 1
-        
-        # Livox ML Data Collection Status
-        livox_ml_stat = f"ML DATA: PC_Frames:{state['livox_pc_frames']:6d}  Last:{state['livox_pc_last_pts']:6d}pts  IMU:{state['livox_imu_samples']:8d}smpls"
-        ml_color = c_ok if state['livox_pc_frames'] > 0 else c_neu
-        safe_add(row, 2, livox_ml_stat, ml_color)
+
+        safe_add(row, 2,  "EXT LOG:OFF", c_neu)
+        safe_add(row, 20, f"EKF: 0x{state['ekf_flags']:04X}", c_neu)
         row += 1
 
         # ============ VIBRATION & PERFORMANCE ============
@@ -2718,12 +3262,9 @@ def draw_dashboard(stdscr, master):
 
         # ============ OBSTACLE AVOIDANCE / SAFETY ============
         safe_add(row, 0, mid, c_info)
-        safe_add(row, 2, "[ OBSTACLE AVOIDANCE ]", c_info)
+        safe_add(row, 2, "[ SAFETY ZONE ]", c_info)
         row += 1
-        
-        obs_color = c_crit if state['livox_obs'] < 0.5 else c_warn if state['livox_obs'] < 1.0 else c_ok
-        obs_line = f"Min Distance: {state['livox_obs']:6.2f}m  Sectors Active: {state['livox_sectors']:2d}  Safety: {'🔴 CRITICAL' if state['livox_obs'] < 0.3 else '🟠 WARNING' if state['livox_obs'] < 0.8 else '🟢 SAFE'}"
-        safe_add(row, 2, obs_line, obs_color)
+        safe_add(row, 2, "Maintain visual line-of-sight and clear flight area before arming/takeoff.", c_neu)
         row += 2
 
         # ============ RC CONTROL ============
@@ -2737,10 +3278,10 @@ def draw_dashboard(stdscr, master):
         safe_add(row, 2, rc_line, c_info)
         row += 1
         
-        safe_add(row, 2, "[TAKEOFF] 1=1m  2=2m  j=Land  [MOVE] i=Fwd  ,=Back  ;=Left  '=Right  [CTRL] a=Arm  d=Disarm  x=KILL  q=Quit", c_warn)
+        safe_add(row, 2, "[TEST] 1=1m hold+land  2=2m hold+land  z=RigProfile toggle  j=Land  [MOVE] i=Fwd  ,=Back  ;=Left  '=Right  [CTRL] a=Arm  d=Disarm  x=KILL  q=Quit", c_warn)
         row += 1
         
-        safe_add(row, 2, "[MODE] h=AltHold  l=Loiter  [MANUAL] W/S=Pitch  ↑↓=Thr  SPACE=Hover  [DBG] r=ROS2  g=SLAM  u=Study  e=Export  t=Rescan  y=TODO  c=Cal  o=Origin", c_warn)
+        safe_add(row, 2, "[MODE] h=AltHold  l=Loiter  [MANUAL] W/S=Pitch  ↑↓=Thr  SPACE=Hover  [TOOLS] u=Study  e=Export  t=Rescan  y=TODO  c=Cal  o=Origin", c_warn)
         row += 2
 
         # ============ EVENT LOG ============
@@ -2825,7 +3366,13 @@ def draw_dashboard(stdscr, master):
             elif key == ord("'"):
                 threading.Thread(target=auto_move_sequence, args=(master, 'right'), daemon=True).start()
             elif key == ord('j'):
-                threading.Thread(target=auto_land_sequence, args=(master,), daemon=True).start()
+                if state['macro_status'] == 'TAKEOFF':
+                    state['land_requested'] = True
+                    update_log("CMD: Land requested. Will transition to LAND after takeoff phase.")
+                elif state['macro_status'] == 'LANDING':
+                    update_log("CMD: LAND already active.")
+                else:
+                    threading.Thread(target=auto_land_sequence, args=(master,), daemon=True).start()
             elif key == ord('n'):
                 # Navigate home (RTL)
                 trigger_rtl(master)
@@ -2926,6 +3473,10 @@ def draw_dashboard(stdscr, master):
             elif key == ord('y'):
                 out = export_ops_todo()
                 update_log(f"TODO exported to {out}")
+            elif key == ord('z'):
+                state['test_rig_mode'] = not state.get('test_rig_mode', False)
+                mode_str = "RIG-CONSTRAINED" if state['test_rig_mode'] else "FREE-FLIGHT"
+                update_log(f"TEST PROFILE -> {mode_str}")
 
         # Only send RC overrides from dashboard when not in autonomous mode
         if state['macro_status'] == 'IDLE':
@@ -2990,6 +3541,8 @@ def draw_study_dashboard(stdscr):
         row = 0
 
         archive = state.get('archive_summary', {})
+        rates = state.get('archive_rates', {})
+        hotspots = state.get('archive_hotspots', [])
 
         safe_add(row, 0, sep, c_info)
         row += 1
@@ -3018,6 +3571,46 @@ def draw_study_dashboard(stdscr):
                 f"imu {archive.get('imu_samples_total', 0):8d} | pc_frames {archive.get('pc_frames_total', 0):6d}"
             ),
             c_neu,
+        )
+        row += 1
+        safe_add(
+            row,
+            2,
+            (
+                f"RATES: armed {rates.get('armed_session_rate_pct', 0.0):5.1f}% | >=0.8m {rates.get('target_08_rate_pct', 0.0):5.1f}% "
+                f"| >=1.0m {rates.get('target_10_rate_pct', 0.0):5.1f}% | critical {rates.get('critical_event_file_rate_pct', 0.0):5.1f}% "
+                f"| failsafe {rates.get('failsafe_session_rate_pct', 0.0):5.1f}%"
+            ),
+            c_warn,
+        )
+        row += 1
+
+        safe_add(
+            row,
+            2,
+            (
+                f"ANOMALY: batt_fs {rates.get('battery_failsafe_session_rate_pct', 0.0):5.1f}% | mag {rates.get('mag_anomaly_session_rate_pct', 0.0):5.1f}% "
+                f"| ekf_flip {rates.get('ekf_aiding_flip_session_rate_pct', 0.0):5.1f}% | crash_disarm {rates.get('crash_disarm_session_rate_pct', 0.0):5.1f}% "
+                f"| rig_pat {rates.get('rig_pattern_session_rate_pct', 0.0):5.1f}%"
+            ),
+            c_warn,
+        )
+        row += 1
+
+        if hotspots:
+            top_hotspots = " | ".join([f"{label}:{count}" for label, count in hotspots[:4]])
+            safe_add(row, 2, f"HOTSPOTS: {top_hotspots}", c_crit)
+            row += 1
+
+        safe_add(
+            row,
+            2,
+            (
+                f"RIG-ANALYSIS: high_tilt_sessions {archive.get('telemetry_sessions_high_tilt', 0):3d} | "
+                f"alt_diverge_sessions {archive.get('telemetry_sessions_alt_diverge', 0):3d} | "
+                f"rig_pattern_sessions {archive.get('telemetry_sessions_rig_pattern', 0):3d}"
+            ),
+            c_warn,
         )
         row += 1
 
@@ -3085,6 +3678,17 @@ def draw_study_dashboard(stdscr):
             safe_add(row, 2, line, color)
             row += 1
             if row >= rows - 3:
+                break
+
+        safe_add(row, 0, mid, c_info)
+        row += 1
+        safe_add(row, 2, "[ LONG TODO PREVIEW ]", c_info)
+        row += 1
+        for idx, todo_text in enumerate(state.get('ops_todo', [])[:8], start=1):
+            color = c_warn if idx < 5 else c_neu
+            safe_add(row, 2, f"{idx:02d}. {todo_text}", color)
+            row += 1
+            if row >= rows - 4:
                 break
 
         safe_add(row, 0, mid, c_info)
@@ -3217,6 +3821,7 @@ if __name__ == '__main__':
             except:
                 pass
         print("[*] Goodbye!")
+
 
 
 
